@@ -1,0 +1,5 @@
+tkextrafont==0.6.3
+BlurWindow==1.2.1
+Heema==2.0.0.9
+pygame==2.6.1
+tinydb==4.8.2
