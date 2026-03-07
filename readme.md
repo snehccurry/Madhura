@@ -45,10 +45,17 @@ Madhura can be used by:
 
 ## Currently only supports Windows 11.
 
+
+## Download
+
+Get the latest version here:
+
+[Madhura v3.7.2026 Release](https://github.com/snehccurry/Madhura/releases/tag/version-3.7.2026)
+
+
 ## Installation
 
-
-Download the zip from the releases, Unzip and use it as you normall would.
+Unzip and use it as you normall would.
 Add it to your startup folder
 
 ## Future Improvements
@@ -61,3 +68,4 @@ Add it to your startup folder
 ## License
 
 MIT License
+
