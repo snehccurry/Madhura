@@ -39,11 +39,11 @@ Madhura can be used by:
 - Students
 - Designers
 - Remote workers
-- Anyone looking to reduce distractions and improve deep work
+- Anyone looking to reduce distractions and improve deep work 
 
 
 
-## Currently only supports Windows 11.
+
 
 
 ## Download
@@ -68,4 +68,5 @@ Add it to your startup folder
 ## License
 
 MIT License
+
 
