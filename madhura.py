@@ -191,7 +191,8 @@ def reset_session():
     timer_label.config(text="00:00")
     status_label.config(text="", fg="#888888")
 
-    root.attributes("-topmost", 1)
+    #root.attributes("-topmost", 1)
+
 
 # =============================
 # ALIGNMENT
@@ -332,6 +333,7 @@ def show_today_summary():
 #==============================
 
 def hide_root_window():
+    root.attributes("-topmost",0)
     root.withdraw()
     create_focus_pill()
 
@@ -577,11 +579,14 @@ def ensure_activity_visibility():
     print(f"is session active? {session_active}")
 
 
-    if not session_active:
+    if session_active == False:
         # Bring main window forward and maximize
 
         # root.deiconify()
-        if (bool(root.attributes("-topmost")) == False):
+
+        is_window_topmost = bool(root.attributes("-topmost"))
+        print(f"is window topmost: {is_window_topmost}")
+        if (is_window_topmost == False and session_active == False):
             print("is topmost ? false!")
             root.attributes("-topmost", 1)
             root.deiconify()
@@ -629,7 +634,7 @@ def activity_watchdog():
     print("checking")
     ensure_activity_visibility()
       # check every 1 sec
-    root.after(1000, activity_watchdog)
+    root.after(10000, activity_watchdog)
 
 
 
@@ -670,7 +675,7 @@ def bind_root_guard():
 
 
 
-# root.after(1000, activity_watchdog)
+root.after(1000, activity_watchdog)
 
 
 bind_root_guard()
