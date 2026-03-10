@@ -325,6 +325,17 @@ def show_today_summary():
           font=("Segoe UI", 15),
           fg="#bbbbbb").pack()
 
+
+
+#==============================
+#HIDE WINDOW FUNCTION
+#==============================
+
+def hide_root_window():
+    root.withdraw()
+    create_focus_pill()
+
+
 # =============================
 # PILL (SINGLE SURFACE + STABLE)
 # =============================
@@ -429,7 +440,7 @@ def create_focus_pill():
 # UI BUILD
 # =============================
 
-root = create_window(text="Madhura")
+root = create_window_with_no_title_bar(text="Madhura")
 
 zen_mode(root)
 apply_theme(root, dark_mode)
@@ -523,9 +534,14 @@ button(button_row, text="Lock", command=set_focus).pack(side=LEFT, padx=10)
 button(button_row, text="Reset", command=reset_session).pack(side=LEFT, padx=10)
 button(button_row, text="Summary", command=show_today_summary).pack(side=LEFT, padx=10)
 
+
 if TEST_MODE:
     button(button_row, text="Notify", command=focus_notification).pack(side=LEFT, padx=10)
     button(button_row, text="Pill", command=create_focus_pill).pack(side=LEFT, padx=10)
+
+
+
+button(button_row, text="Hide", command=hide_root_window).pack(side=LEFT, padx=10)
 
 if TEST_MODE:
     stats_frame = frame(main_frame)
@@ -566,6 +582,7 @@ def ensure_activity_visibility():
 
         # root.deiconify()
         if (bool(root.attributes("-topmost")) == False):
+            print("is topmost ? false!")
             root.attributes("-topmost", 1)
             root.deiconify()
 
@@ -653,7 +670,7 @@ def bind_root_guard():
 
 
 
-root.after(1000, activity_watchdog)
+# root.after(1000, activity_watchdog)
 
 
 bind_root_guard()
