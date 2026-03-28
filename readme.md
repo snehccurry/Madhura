@@ -50,7 +50,7 @@ Madhura can be used by:
 
 Get the latest version here:
 
-[Madhura v3.7.2026 Release](https://github.com/snehccurry/Madhura/releases/tag/version-3.7.2026)
+[Madhura Windows 11 Release](https://github.com/snehccurry/Madhura/releases/tag/version-3.7.2026)
 
 
 ## Installation
