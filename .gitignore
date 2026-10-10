@@ -14,8 +14,8 @@ htmlcov/
 build/
 dist/
 
-# Local app data (portable/dev runs)
-data/
+# Local app data (portable/dev runs) — root only; madhura/data/ is source code
+/data/
 *.db
 *.db-wal
 *.db-shm

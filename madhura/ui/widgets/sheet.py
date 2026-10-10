@@ -315,6 +315,10 @@ class SheetHost(QWidget):
         """Contents waiting to be shown."""
         return list(self._queue)
 
+    def relayout(self) -> None:
+        """Re-fit the card to the current sheet's content (after its height changed)."""
+        self._layout_card(self._progress)
+
     def card_geometry(self) -> QRect:
         """Geometry of the visible card (host coordinates, excluding the shadow margin)."""
         m = _CARD_MARGIN
@@ -424,7 +428,13 @@ class SheetHost(QWidget):
         w = sheet_width_of(content)
         m = _CARD_MARGIN
         max_h = max(160, self.height() - 64)
-        h = min(self._card.content_height(w), max_h)
+        content_h = self._card.content_height(w)
+        h = min(content_h, max_h)
+        # Content that fits never gets a scrollbar. (Left "as needed", QScrollArea keeps a bar it
+        # showed once if wrapped text grows a line in the 10 px narrower viewport.)
+        policy = Qt.ScrollBarPolicy.ScrollBarAsNeeded if content_h > max_h else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        if self._card.scroll.verticalScrollBarPolicy() != policy:
+            self._card.scroll.setVerticalScrollBarPolicy(policy)
         offset = 0 if not animations.motion_enabled() else int(round((1.0 - progress) * 12))
         x = (self.width() - w) // 2
         y = max(32, (self.height() - h) // 2) + offset
