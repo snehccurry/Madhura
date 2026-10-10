@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "madhura"
+version = "2.0.0"
+description = "Plan the hour. Stay with it. A calm, intentional focus companion."
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Abhay Gaur" }]
+keywords = ["focus", "pomodoro", "productivity", "habits", "timer"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: X11 Applications :: Qt",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Office/Business :: Scheduling",
+]
+dependencies = ["PySide6-Essentials>=6.8,<6.10"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pytest-qt>=4.2"]
+
+[project.gui-scripts]
+madhura = "madhura.app:main"
+
+[tool.setuptools.packages.find]
+include = ["madhura*"]
+
+[tool.setuptools.package-data]
+madhura = ["assets/*", "assets/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+qt_api = "pyside6"
