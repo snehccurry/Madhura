@@ -348,6 +348,14 @@ class FloatingPanel(QWidget):
     # ------------------------------------------------------------------ geometry
     def desired_height(self) -> int:
         """Window height needed for the content at the current width."""
+        self.ensurePolished()  # QSS fonts/margins of the children change their size hints
+        if not self.isVisible():
+            # Before the first show Qt keeps stale cached size hints for nested containers whose
+            # children were shown/hidden or re-texted (e.g. the check-in intro line), so the
+            # stack would lay out a card that then grows downward over the pill.
+            for child in self.findChildren(QWidget):
+                if child.layout() is not None:
+                    child.updateGeometry()
         self._layout.activate()
         if self._layout.hasHeightForWidth():
             h = self._layout.totalHeightForWidth(self._card_width + 2 * self.shadow_margin)
@@ -557,15 +565,25 @@ class FloatingPanel(QWidget):
 
     def event(self, e: QEvent) -> bool:
         if e.type() == QEvent.Type.LayoutRequest and self.isVisible() and not self._closing:
-            QTimer.singleShot(0, self._on_layout_request)
+            QTimer.singleShot(0, self, self._on_layout_request)
         return super().event(e)
 
     def _on_layout_request(self) -> None:
-        if _is_valid(self) and self.isVisible() and not self._closing:
-            target_h = self.desired_height()
-            if self._geom_anim is None and target_h == self.height():
+        if not (_is_valid(self) and self.isVisible() and not self._closing):
+            return
+        stack = PopupStack.instance_if_exists()
+        if stack is not None and stack.is_visible_panel(self):
+            # The window may already have grown (downward) to its layout's minimum size, so
+            # compare with where the stack wants the card, not with the current height.
+            target = next((g for p, g in stack.target_geometries() if p is self), None)
+            if self._geom_anim is None and target == self.geometry():
                 return
-            self.sync_size(animate=True)
+            stack.relayout(animate=True, duration=180)
+            return
+        target_h = self.desired_height()
+        if self._geom_anim is None and target_h == self.height():
+            return
+        self.sync_size(animate=True)
 
     def paintEvent(self, _event: QPaintEvent) -> None:  # noqa: N802
         pal = theme.palette()

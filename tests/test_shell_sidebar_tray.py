@@ -90,6 +90,8 @@ def test_footer_idle_shows_progress_toward_goal(shell: AppContext) -> None:  # n
 
 def test_footer_running_paused_break(shell: AppContext) -> None:  # noqa: F811
     status = shell.window.sidebar.status  # type: ignore[union-attr]
+    # Nobody answers check-ins here; with them on, two misses would pause the session (§1.5).
+    shell.settings.update(checkin_enabled=False)
     shell.engine.start("Write the quarterly report", 45)
     assert status.mode() == "focus" and status.status_text() == "45 min · Write the quarterly report"
     advance(shell, 22 * 60 + 10)
@@ -185,6 +187,7 @@ def test_tray_tooltip_throttled(shell: AppContext) -> None:  # noqa: F811
 
 def test_tray_menu_states(tray_shell: AppContext) -> None:  # noqa: F811
     ctx = tray_shell
+    ctx.window.show_main()  # type: ignore[union-attr] # pill_mode "hidden": no pill while the window is up
     tray = Tray(ctx)
     try:
         tray.refresh_menu()
@@ -203,6 +206,13 @@ def test_tray_menu_states(tray_shell: AppContext) -> None:  # noqa: F811
         tray.action("extend").trigger()
         assert ctx.engine.planned_seconds == planned + 300
         assert tray.action("pill").text() == "Mini timer: Show" and tray.action("pill").isEnabled()
+        ctx.window.hide_main()  # type: ignore[union-attr] # → the pill shows (§1.6)
+        tray.menu.aboutToShow.emit()
+        assert ctx.pill is not None and ctx.pill.is_showing()
+        assert tray.action("pill").text() == "Mini timer: Hide"
+        tray.action("pill").trigger()  # user-hidden until the session ends
+        tray.menu.aboutToShow.emit()
+        assert not ctx.pill.is_showing() and tray.action("pill").text() == "Mini timer: Show"
         advance(ctx, 90)
         tray.action("finish").trigger()
         assert str(ctx.engine.state) == "idle"

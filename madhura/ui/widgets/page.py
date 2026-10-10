@@ -45,7 +45,10 @@ class PageScroll(QScrollArea):
         self.column.setMaximumWidth(max_width)
         self.column.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         row.addStretch(1)
-        row.addWidget(self.column, 1000)
+        # Top-aligned: the column is as tall as its content. (An alignment on content_layout
+        # itself is ignored for a widget's top-level layout, so a short page would otherwise
+        # stretch its Preferred children — e.g. a gap opening between a title and its caption.)
+        row.addWidget(self.column, 1000, Qt.AlignmentFlag.AlignTop)
         row.addStretch(1)
         #: Vertical layout of the page content.
         self.content_layout = QVBoxLayout(self.column)
@@ -97,6 +100,7 @@ class PageHeader(QWidget):
         self._subtitle.setWordWrap(True)
         self._subtitle.setVisible(bool(subtitle))
         col.addWidget(self._subtitle)
+        col.addStretch(1)  # the title sits at the same height on every page, caption or not
         lay.addLayout(col, 1)
         self.actions_layout = QHBoxLayout()
         self.actions_layout.setSpacing(8)
@@ -127,5 +131,5 @@ class PageHeader(QWidget):
 
     def add_action(self, widget: QWidget) -> QWidget:
         """Append a right-aligned action widget."""
-        self.actions_layout.addWidget(widget, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.actions_layout.addWidget(widget, 0, Qt.AlignmentFlag.AlignTop)
         return widget

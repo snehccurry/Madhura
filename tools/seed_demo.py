@@ -177,10 +177,13 @@ def seed_demo(
                 continue  # an occasional day off
             progress = offset / max(1, total_days - 1)
             intensity = 0.75 + 0.45 * progress
+            last_end: datetime | None = None
             for slot in _day_slots(rng, workday, intensity):
                 started = datetime.combine(d, slot)
                 if started.hour < day_start_hour:
                     started += timedelta(days=1)
+                if last_end is not None and started < last_end + timedelta(minutes=10):
+                    started = last_end + timedelta(minutes=10)  # a long block pushes the next one
                 planned_min = _weighted(rng, [(25, 22), (45, 30), (60, 34), (90, 14)])
                 roll = rng.random()
                 if roll < 0.07:
@@ -196,6 +199,7 @@ def seed_demo(
                 ended = started + timedelta(seconds=focused + paused)
                 if ended > now:
                     continue
+                last_end = ended
                 project = _weighted(rng, project_pairs)
                 task = rng.choice(PROJECTS[project])
                 sid = repo.create_session(task, project, None, started, planned_min * 60)

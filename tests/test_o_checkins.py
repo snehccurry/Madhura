@@ -495,3 +495,21 @@ def test_popup_without_service_is_a_preview(qapp: QApplication, octx: AppContext
     assert popup.confirmation() == "Nice — keep going"
     popup.hide()
     popup.deleteLater()
+
+
+def test_panel_titles_are_balanced_without_a_one_word_widow(qapp) -> None:  # noqa: ANN001
+    from PySide6.QtGui import QFontMetrics
+
+    from madhura.ui import fonts
+    from madhura.ui.overlays._panel_kit import ClampText, clamp_lines
+
+    font = fonts.font(15, 600)
+    text = "Still on Prepare slides for Thursday's sync?"
+    width = QFontMetrics(font).horizontalAdvance("Still on Prepare slides for Thursday's") + 4
+    assert clamp_lines(text, font, width, 2)[-1] == "sync?"  # plain greedy wrap
+    balanced = clamp_lines(text, font, width, 2, balance=True)
+    assert len(balanced) == 2 and " " in balanced[-1]
+    assert " ".join(balanced) == text
+    label = ClampText(text, 15, 600, 2)
+    assert label.lines(width) == balanced
+    assert clamp_lines(text * 3, font, width, 2, balance=True)[-1].endswith("…")  # still elides

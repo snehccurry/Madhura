@@ -45,6 +45,13 @@ def _render(widget) -> QImage:  # noqa: ANN001
     return img
 
 
+def _mouse_move(widget, pos: QPoint) -> None:  # noqa: ANN001
+    """Move the pointer to *pos*. Qt drops a move to the global position the pointer already has
+    (an earlier test may have left it exactly there), so step off it first."""
+    QTest.mouseMove(widget, pos + QPoint(3, 3))
+    QTest.mouseMove(widget, pos)
+
+
 # =========================================================================== helpers
 
 
@@ -148,7 +155,7 @@ def test_bar_chart_mouse_hover_and_callout(tm, qtbot) -> None:  # noqa: ANN001
     chart.show()
     seen: list[int] = []
     chart.hovered.connect(seen.append)
-    QTest.mouseMove(chart, chart.slot_rect(0).center().toPoint())
+    _mouse_move(chart, chart.slot_rect(0).center().toPoint())
     assert chart.hover_index == 0 and seen[-1] == 0
     assert chart.callout_text() == "Tue 14 Oct · 2h 15m · 3 sessions"
     img = _render(chart)  # callout painted
@@ -308,7 +315,7 @@ def test_heatmap_hover_callout_and_keyboard(tm, qtbot) -> None:  # noqa: ANN001
     hm.resize(420, hm.height())
     hm.set_data(_matrix(), use_24h=True)
     hm.show()
-    QTest.mouseMove(hm, hm.cell_rect(1, 10).center().toPoint())
+    _mouse_move(hm, hm.cell_rect(1, 10).center().toPoint())
     assert hm.hover_cell == (1, 10)
     assert hm.callout_text() == "Tue 10:00–11:00 · 1h 20m focused"
     assert hm.callout_text((0, 6)) == "Mon 06:00–07:00 · No focus"
@@ -344,7 +351,7 @@ def test_heatmap_not_enough_data(tm, qtbot) -> None:  # noqa: ANN001
     hm.set_data(_matrix(), enough=False)
     hm.show()
     assert not hm.has_enough_data()
-    QTest.mouseMove(hm, hm.cell_rect(1, 10).center().toPoint())
+    _mouse_move(hm, hm.cell_rect(1, 10).center().toPoint())
     assert hm.hover_cell is None
     assert hm.accessibleDescription() == "Patterns appear after a few sessions."
     _render(hm)
@@ -390,7 +397,7 @@ def test_hbar_list_empty_text_and_tooltip(tm, qtbot) -> None:  # noqa: ANN001
     lst.show()
     ev = QHelpEvent(QEvent.Type.ToolTip, QPoint(10, 5), lst.mapToGlobal(QPoint(10, 5)))
     assert lst.event(ev) is True
-    QTest.mouseMove(lst, QPoint(10, 5))
+    _mouse_move(lst, QPoint(10, 5))
     assert lst._hover == 0  # noqa: SLF001
     _render(lst)
 

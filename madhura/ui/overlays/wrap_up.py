@@ -38,7 +38,7 @@ from madhura.ui.widgets.sheet import SheetContent
 if TYPE_CHECKING:
     from madhura.context import AppContext
 
-__all__ = ["WrapUpSheet", "next_day_word"]
+__all__ = ["WrapUpSheet", "next_day_word", "open_wrap_up"]
 
 log = logging.getLogger(__name__)
 
@@ -531,3 +531,24 @@ class WrapUpSheet(SheetContent):
         when = "tomorrow" if self._word == "tomorrow" else self._word
         self._toast(f"Shutdown complete — see you {when}.", kind="success")
         self.close_sheet()
+
+
+def open_wrap_up(ctx: AppContext, *, show_main: bool = True) -> WrapUpSheet | None:
+    """Show the WrapUpSheet (main window on the Focus page first when *show_main*).
+
+    Every entry point (Focus page footer, tray menu, the after-work prompt) goes through here, so
+    a wrap-up that is already open or queued is reused instead of stacking a second one.
+    """
+    window = ctx.window
+    if window is None:
+        return None
+    if show_main:
+        window.show_main("focus", activate=True)
+    host = getattr(window, "sheet_host", None)
+    if host is not None:
+        for sheet in (host.current(), *host.queued()):
+            if isinstance(sheet, WrapUpSheet):
+                return sheet
+    sheet = WrapUpSheet(ctx)
+    window.show_sheet(sheet)
+    return sheet

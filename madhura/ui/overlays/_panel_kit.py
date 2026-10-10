@@ -65,11 +65,7 @@ def quote(text: str, limit: int = 40) -> str:
     return f"‘{text}’"
 
 
-def clamp_lines(text: str, font: QFont, width: int, max_lines: int) -> list[str]:
-    """Word-wrap *text* to *width* px and keep at most *max_lines* lines (the last one elided)."""
-    width = max(1, int(width))
-    fm = QFontMetrics(font)
-    out: list[str] = []
+def _wrap_spans(text: str, font: QFont, width: int) -> list[tuple[int, int]]:
     layout = QTextLayout(text, font)
     layout.beginLayout()
     spans: list[tuple[int, int]] = []
@@ -80,6 +76,29 @@ def clamp_lines(text: str, font: QFont, width: int, max_lines: int) -> list[str]
         line.setLineWidth(width)
         spans.append((line.textStart(), line.textLength()))
     layout.endLayout()
+    return spans
+
+
+def clamp_lines(text: str, font: QFont, width: int, max_lines: int, *, balance: bool = False) -> list[str]:
+    """Word-wrap *text* to *width* px and keep at most *max_lines* lines (the last one elided).
+
+    ``balance``: when the text fits in 2..max_lines lines, wrap at the narrowest width that keeps
+    that line count, so a title never ends in a one-word widow ("Still on … Thursday's" / "sync?").
+    """
+    width = max(1, int(width))
+    fm = QFontMetrics(font)
+    out: list[str] = []
+    spans = _wrap_spans(text, font, width)
+    count = len(spans)
+    if balance and 1 < count <= max_lines:
+        lo, hi = max(1, width // (count + 1)), width
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if len(_wrap_spans(text, font, mid)) <= count:
+                hi = mid
+            else:
+                lo = mid + 1
+        spans = _wrap_spans(text, font, hi)
     for i, (start, length) in enumerate(spans):
         if i == max_lines - 1 and len(spans) > max_lines:
             rest = text[start:].replace("\n", " ").strip()
@@ -152,7 +171,8 @@ class Glyph(QWidget):
 
 
 class ClampText(QWidget):
-    """Left-aligned text wrapped to at most ``max_lines`` lines (last line elided).
+    """Left-aligned text wrapped to at most ``max_lines`` lines (last line elided); lines that fit
+    are balanced (no one-word widow) unless ``balance=False``.
 
     ``color`` is a palette token ("text", "text_muted", "success" …) resolved at paint time.
     """
@@ -168,9 +188,11 @@ class ClampText(QWidget):
         color: str = "text",
         tabular: bool = False,
         line_spacing: int = 2,
+        balance: bool = True,
     ) -> None:
         super().__init__(parent)
         self._text = text
+        self._balance = bool(balance)
         self._max_lines = max(1, int(max_lines))
         self._color = color
         self._line_spacing = line_spacing
@@ -202,7 +224,8 @@ class ClampText(QWidget):
 
     def lines(self, width: int | None = None) -> list[str]:
         """The rendered lines at *width* (default: current width)."""
-        return clamp_lines(self._text, self.font(), width if width is not None else self.width(), self._max_lines)
+        width = width if width is not None else self.width()
+        return clamp_lines(self._text, self.font(), width, self._max_lines, balance=self._balance)
 
     # ------------------------------------------------------------------ sizing
     def _line_h(self) -> int:

@@ -14,8 +14,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import QEasingCurve, QEvent, QObject, QRect, QRectF, Qt, QTimer, QVariantAnimation, Signal
-from PySide6.QtGui import QColor, QKeyEvent, QMouseEvent, QPainter, QPaintEvent
+from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPointF, QRect, QRectF, Qt, QTimer, QVariantAnimation, Signal
+from PySide6.QtGui import QColor, QKeyEvent, QMouseEvent, QPainter, QPaintEvent, QPen
 from PySide6.QtWidgets import (
     QAbstractButton,
     QApplication,
@@ -122,7 +122,13 @@ class SheetContent(QWidget):
         self._footer_row.addLayout(self.footer_left)
         self._footer_row.addStretch(1)
         self._footer_row.addLayout(self.footer)
-        self._outer.addLayout(self._footer_row)
+        self._footer_visible = True
+        self._pinned_right_extra = 0  # the body's scrollbar width, so the buttons line up
+        #: Holds the footer row. When the sheet is taller than the window the host pins it under
+        #: the scrolling body (so "Done" / "Save" stay reachable) and puts it back afterwards.
+        self.footer_box = QWidget(self)
+        self.footer_box.setLayout(self._footer_row)
+        self._outer.addWidget(self.footer_box)
 
     # ------------------------------------------------------------------ helpers
     def set_title(self, title: str, subtitle: str | None = None) -> None:
@@ -170,7 +176,42 @@ class SheetContent(QWidget):
                 w = lay.itemAt(i).widget()
                 if w is not None:
                     w.setVisible(visible)
-        self._footer_row.setContentsMargins(0, self._footer_spacing if visible else 0, 0, 0)
+        self._footer_visible = bool(visible)
+        self._apply_footer_margins()
+
+    def footer_pinned(self) -> bool:
+        """True while the host shows the footer pinned under the scrolling body."""
+        return self.footer_box.parentWidget() is not self
+
+    def _apply_footer_margins(self) -> None:
+        if self.footer_pinned():
+            pad = self.padding
+            right = pad + self._pinned_right_extra
+            self._footer_row.setContentsMargins(pad, 16 if self._footer_visible else 0, right, pad if self._footer_visible else 0)
+        else:
+            self._footer_row.setContentsMargins(0, self._footer_spacing if self._footer_visible else 0, 0, 0)
+
+    def _footer_inline_height(self) -> int:
+        """Height the footer takes inside the sheet (not pinned)."""
+        m = self._footer_row.contentsMargins()
+        inner = self._footer_row.totalSizeHint().height() - m.top() - m.bottom()
+        return max(0, inner) + (self._footer_spacing if self._footer_visible else 0)
+
+    def _pin_footer(self, holder: QVBoxLayout | None) -> None:
+        """Move the footer into *holder* (pinned) or back to the end of the sheet (None)."""
+        box = self.footer_box
+        if holder is None:
+            if box.parentWidget() is self:
+                return
+            box.setParent(self)  # leaves the holder's layout
+            self._outer.addWidget(box)
+        else:
+            if box.parentWidget() is holder.parentWidget():
+                return
+            box.setParent(holder.parentWidget())  # leaves self._outer
+            holder.addWidget(box)
+        self._apply_footer_margins()
+        box.show()
 
     def initial_focus_widget(self) -> QWidget | None:
         """Widget focused when the sheet opens (default: first text input, else primary button)."""
@@ -211,6 +252,11 @@ class _SheetCard(QWidget):
         self.scroll.viewport().setAutoFillBackground(False)
         self.scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         lay.addWidget(self.scroll)
+        #: Pinned footer slot (see :meth:`SheetContent._pin_footer`).
+        self.footer_holder = QVBoxLayout()
+        self.footer_holder.setContentsMargins(0, 0, 0, 0)
+        self.footer_holder.setSpacing(0)
+        lay.addLayout(self.footer_holder)
         self._content: QWidget | None = None
 
     def set_content(self, content: QWidget) -> None:
@@ -222,9 +268,34 @@ class _SheetCard(QWidget):
     def take_content(self) -> QWidget | None:
         c = self._content
         if c is not None:
+            self.pin_footer(False)
             self.scroll.takeWidget()
         self._content = None
         return c
+
+    def pinned_footer(self) -> QWidget | None:
+        """The content's footer box while it is pinned under the scroll area."""
+        c = self._content
+        if isinstance(c, SheetContent) and c.footer_pinned():
+            return c.footer_box
+        return None
+
+    def pin_footer(self, pinned: bool) -> None:
+        """Pin the content's footer under the scroll area (or put it back into the content)."""
+        c = self._content
+        if isinstance(c, SheetContent) and pinned != c.footer_pinned():
+            c._pinned_right_extra = self.scroll.verticalScrollBar().sizeHint().width()  # noqa: SLF001
+            c._pin_footer(self.footer_holder if pinned else None)  # noqa: SLF001
+            self.update()
+
+    def footer_height(self, width: int) -> int:
+        """Height of the pinned footer (0 when the footer is inside the content)."""
+        box = self.pinned_footer()
+        if box is None:
+            return 0
+        lay = box.layout()
+        lay.activate()
+        return lay.totalHeightForWidth(width) if lay.hasHeightForWidth() else lay.totalSizeHint().height()
 
     def content_height(self, width: int) -> int:
         c = self._content
@@ -245,6 +316,11 @@ class _SheetCard(QWidget):
         paint_shadow(p, QRectF(self.rect()), SHEET_RADIUS, _CARD_MARGIN, blur=40, offset_y=12)
         m = _CARD_MARGIN
         fill_rounded(p, QRectF(self.rect()).adjusted(m, m, -m, -m), SHEET_RADIUS, pal.surface, pal.border_strong if pal.is_dark else pal.border)
+        box = self.pinned_footer()
+        if box is not None:  # hairline between the scrolling body and the pinned footer
+            y = box.geometry().top() + 0.5
+            p.setPen(QPen(QColor(pal.border), 1.0))
+            p.drawLine(QPointF(m + 1, y), QPointF(self.width() - m - 1, y))
         p.end()
 
 
@@ -344,7 +420,7 @@ class SheetHost(QWidget):
         self.sheetOpened.emit(content)
         if not was_active:
             self.activeChanged.emit(True)
-        QTimer.singleShot(0, lambda: self._focus_into(content))
+        QTimer.singleShot(0, content, lambda: self._focus_into(content))
         content.on_shown()
 
     def _focus_into(self, content: SheetContent) -> None:
@@ -428,11 +504,17 @@ class SheetHost(QWidget):
         w = sheet_width_of(content)
         m = _CARD_MARGIN
         max_h = max(160, self.height() - 64)
-        content_h = self._card.content_height(w)
-        h = min(content_h, max_h)
+        card = self._card
+        content_h = card.content_height(w)
+        # A sheet taller than the window scrolls its body under a pinned footer.
+        inline_h = content_h + (content._footer_inline_height() if content.footer_pinned() else 0)  # noqa: SLF001
+        card.pin_footer(inline_h > max_h)
+        content_h = card.content_height(w)
+        footer_h = card.footer_height(w)
+        h = min(content_h + footer_h, max_h)
         # Content that fits never gets a scrollbar. (Left "as needed", QScrollArea keeps a bar it
         # showed once if wrapped text grows a line in the 10 px narrower viewport.)
-        policy = Qt.ScrollBarPolicy.ScrollBarAsNeeded if content_h > max_h else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        policy = Qt.ScrollBarPolicy.ScrollBarAsNeeded if content_h + footer_h > max_h else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         if self._card.scroll.verticalScrollBarPolicy() != policy:
             self._card.scroll.setVerticalScrollBarPolicy(policy)
         offset = 0 if not animations.motion_enabled() else int(round((1.0 - progress) * 12))
@@ -505,7 +587,7 @@ class SheetHost(QWidget):
             if w is content or w is None:
                 break
             if (
-                content.isAncestorOf(w)
+                (content.isAncestorOf(w) or content.footer_box.isAncestorOf(w))
                 and w.isVisible()
                 and w.isEnabled()
                 and bool(w.focusPolicy() & Qt.FocusPolicy.TabFocus)
@@ -521,7 +603,8 @@ class SheetHost(QWidget):
             return
         items = self._focusables()
         if items:
-            QTimer.singleShot(0, lambda: items[0].setFocus(Qt.FocusReason.OtherFocusReason) if _is_valid(items[0]) else None)
+            first = items[0]
+            QTimer.singleShot(0, first, lambda: first.setFocus(Qt.FocusReason.OtherFocusReason))
 
     def _install_filter(self) -> None:
         if self._filter_installed:

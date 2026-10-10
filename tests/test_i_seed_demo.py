@@ -41,6 +41,8 @@ def test_seed_demo_contents(seed, tmp_path: Path) -> None:  # noqa: ANN001
         assert len({s.project for s in sessions}) >= 4 and None in {s.project for s in sessions}
         assert len({s.started_at.hour for s in sessions}) >= 8
         assert any(s.note for s in sessions)
+        ordered = sorted(sessions, key=lambda s: s.started_at)
+        assert all(a.ended_at <= b.started_at for a, b in zip(ordered, ordered[1:], strict=False)), "sessions overlap"
         today_sessions = [s for s in sessions if logical_date(s.started_at, 4) == date(2026, 10, 14)]
         assert all(s.started_at < NOW for s in today_sessions)
         checkins = repo.checkins_between(datetime(2026, 1, 1), datetime(2027, 1, 1))

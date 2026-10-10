@@ -56,6 +56,19 @@ def test_pages_and_default_size(shell: AppContext) -> None:  # noqa: F811
     assert win.windowTitle() == "Madhura"
 
 
+def test_pages_are_built_on_first_use(shell: AppContext) -> None:  # noqa: F811
+    win = _win(shell)
+    pages = win.pages
+    assert list(pages) == ["focus", "habits", "insights", "settings"] and "settings" in pages
+    assert pages.is_built("focus")  # type: ignore[attr-defined]
+    assert not any(pages.is_built(k) for k in ("habits", "insights", "settings"))  # type: ignore[attr-defined]
+    assert win.stack.count() == 1
+    win.show_page("settings")
+    assert pages.is_built("settings") and win.stack.currentWidget() is pages["settings"]  # type: ignore[attr-defined]
+    assert pages["settings"] is pages["settings"] and win.stack.count() == 2  # built once
+    assert "nope" not in pages and pages.get("nope") is None
+
+
 def test_navigation_paths_and_on_shown(shell: AppContext, qtbot) -> None:  # noqa: F811, ANN001
     win = _win(shell)
     win.show_main()
@@ -441,3 +454,34 @@ def test_broken_page_shows_fallback(qapp: QApplication, data_dir: Path, fake_clo
         assert win.current_page() == "insights"
     finally:
         dispose_shell(ctx, qapp)
+
+
+def test_page_switch_never_gives_keyboard_focus_to_a_page_control(shell: AppContext, qtbot) -> None:  # noqa: F811, ANN001
+    """Switching pages hands focus to the new page itself: no Tab-reason focus (and keyboard
+    focus ring) on its first control — e.g. the empty Insights page hides its range control."""
+    from PySide6.QtCore import QObject
+
+    win = _win(shell)
+    win.show_main(activate=True)
+    _activate(win)
+    focus_page = win.page("focus")
+    focus_page.setFocus(Qt.FocusReason.OtherFocusReason)  # the Focus page parks focus on itself
+    reasons: list[tuple[str, Qt.FocusReason]] = []
+
+    class Spy(QObject):
+        def eventFilter(self, obj, event):  # type: ignore[no-untyped-def]  # noqa: N802
+            if event.type() == QEvent.Type.FocusIn:
+                reasons.append((type(obj).__name__, event.reason()))
+            return False
+
+    spy = Spy()
+    QApplication.instance().installEventFilter(spy)
+    try:
+        for key in ("insights", "habits", "settings", "focus"):
+            win.show_page(key)
+            QApplication.processEvents()
+            assert QApplication.focusWidget() is win.page(key), key
+    finally:
+        QApplication.instance().removeEventFilter(spy)
+    keyboard = {Qt.FocusReason.TabFocusReason, Qt.FocusReason.BacktabFocusReason, Qt.FocusReason.ShortcutFocusReason}
+    assert not [r for r in reasons if r[1] in keyboard], reasons

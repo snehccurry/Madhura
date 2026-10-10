@@ -646,7 +646,7 @@ class OnboardingSheet(SheetContent):
         host = self.host()
         fit = getattr(host, "relayout", None)
         if callable(fit):
-            QTimer.singleShot(0, fit)
+            QTimer.singleShot(0, host, fit)  # host as context: dropped if it is deleted first
 
     # ------------------------------------------------------------------ navigation
     def step(self) -> int:

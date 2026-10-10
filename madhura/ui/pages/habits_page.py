@@ -365,7 +365,9 @@ class _SummaryCard(Card):
         done = sum(1 for s in states if s == "done")
         skipped = sum(1 for s in states if s == "skipped")
         counted = total - skipped
-        self.bar.set_states(states)
+        # Progress fills from the left: done, then skipped, then what's left to do.
+        order = {"done": 0, "skipped": 1}
+        self.bar.set_states(sorted(states, key=lambda st: order.get(st, 2)))
         if total == 0:
             self.done_label.hide()
             self.of_label.hide()
@@ -687,7 +689,7 @@ class HabitsPage(PageScroll):
         self.refresh()
         row = self._rows.get(int(habit_id))
         if row is not None:
-            QTimer.singleShot(0, lambda: self.ensureWidgetVisible(row, 0, 24) if row.isVisible() else None)
+            QTimer.singleShot(0, row, lambda: self.ensureWidgetVisible(row, 0, 24) if row.isVisible() else None)
 
     def _on_suggestion(self, name: str) -> None:
         self.new_habit(str(name))

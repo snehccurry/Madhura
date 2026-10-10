@@ -56,7 +56,9 @@ class Toggle(KeyboardFocusMixin, QAbstractButton):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         if not self.isEnabled():
-            p.setOpacity(0.45)
+            self._paint_disabled(p, pal, t)
+            p.end()
+            return
         off = theme.mix(pal.track, pal.text_subtle, 0.25 * h)
         on = theme.mix(pal.accent, pal.accent_hover, h)
         track = theme.mix(off, on, t)
@@ -71,3 +73,19 @@ class Toggle(KeyboardFocusMixin, QAbstractButton):
         p.setBrush(knob_color)
         p.drawEllipse(knob)
         p.end()
+
+    @staticmethod
+    def _paint_disabled(p: QPainter, pal: theme.Palette, t: float) -> None:
+        """Disabled: flat track with a visible hairline outline and a muted knob (no opacity
+        wash, which made the switch vanish on light surfaces)."""
+        accent_soft = theme.mix(pal.surface, pal.accent, 0.4)
+        track = theme.mix(pal.surface_alt, accent_soft, t)
+        border = theme.mix(pal.border_strong, accent_soft, t)
+        fill_rounded(p, QRectF(0, 0, _TRACK_W, _TRACK_H), _TRACK_H / 2.0, track, border)
+        x = 2 + t * (_TRACK_W - _KNOB - 4)
+        knob = QRectF(x, (_TRACK_H - _KNOB) / 2.0, _KNOB, _KNOB).adjusted(1, 1, -1, -1)
+        off_knob = theme.mix(pal.surface_alt, pal.text_subtle, 0.55)
+        on_knob = theme.mix(pal.surface, QColor("#FFFFFF"), 0.75)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(theme.mix(off_knob, on_knob, t))
+        p.drawEllipse(knob)

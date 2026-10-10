@@ -9,7 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
 from PySide6.QtCore import QRect, QSize, Qt, QTimer  # noqa: E402
-from PySide6.QtGui import QGuiApplication  # noqa: E402
+from PySide6.QtGui import QColor, QGuiApplication  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QLineEdit, QVBoxLayout, QWidget  # noqa: E402
 
@@ -179,6 +179,42 @@ def test_stack_avoids_obstacle(qtbot) -> None:  # type: ignore[no-untyped-def]
     assert panel.visual_geometry().bottom() == avail.y() + avail.height() - 16 - 1
 
 
+def test_content_changed_before_present_is_measured(qtbot) -> None:  # type: ignore[no-untyped-def]
+    """A nested label shown after set_content() but before present() (e.g. the check-in intro)
+    is part of the laid-out height: the card must not grow downward over the obstacle."""
+    stack = PopupStack.instance()
+    avail = QGuiApplication.primaryScreen().availableGeometry()
+    pill = FloatingPanel("pill", width=120)
+    _KEEP.append(pill)
+    pill.set_content(QLabel("23m"))
+    card = QRect(avail.right() - 16 - 120, avail.bottom() - 16 - 36, 120, 36)
+    pill.setGeometry(pill.window_rect_for_card(QRect(card.topLeft(), QSize(120, pill.card_size().height()))))
+    pill.show()
+    stack.set_obstacle(pill)
+    panel = FloatingPanel("checkin")
+    _KEEP.append(panel)
+    body = QWidget()
+    outer = QVBoxLayout(body)
+    outer.setContentsMargins(0, 0, 0, 0)
+    inner = QWidget(body)
+    inner_lay = QVBoxLayout(inner)
+    inner_lay.setContentsMargins(0, 0, 0, 0)
+    inner_lay.addWidget(QLabel("Still on it?"))
+    intro = QLabel("Quick honesty check — only you see this.")
+    inner_lay.addWidget(intro)
+    intro.hide()
+    outer.addWidget(inner)
+    outer.addWidget(Button("Focused", "primary"))
+    panel.set_content(body)  # measured without the intro
+    intro.show()
+    panel.present()
+    for _ in range(3):
+        QApplication.processEvents()
+    assert panel.visual_geometry().bottom() < pill.visual_geometry().top()
+    assert panel.visual_geometry().height() == panel.card_size().height()
+    stack.set_obstacle(None)
+
+
 def test_set_content_keeps_bottom_edge(qtbot) -> None:  # type: ignore[no-untyped-def]
     panel = _panel("checkin")
     panel.present()
@@ -288,6 +324,34 @@ def test_sheet_queue_and_focus(qtbot) -> None:  # type: ignore[no-untyped-def]
     assert before.hasFocus()  # focus restored
 
 
+def test_tall_sheet_pins_its_footer(qtbot) -> None:  # type: ignore[no-untyped-def]
+    """A sheet taller than the window scrolls its body under a pinned footer (the primary
+    button stays reachable); when it fits again the footer goes back into the sheet."""
+    win = _window(qtbot, 800, 420)
+    host = SheetHost(win)
+    sheet = _Sheet("Tall")
+    for i in range(14):
+        sheet.body.addWidget(QLabel(f"Row {i}"))
+    host.show_sheet(sheet)
+    QApplication.processEvents()
+    assert sheet.footer_pinned()
+    card = host.card_geometry()
+    ok = sheet.ok.mapTo(host, sheet.ok.rect().bottomRight())
+    assert card.contains(ok), "the pinned primary button is inside the visible card"
+    assert not sheet.isAncestorOf(sheet.ok)  # it lives under the scroll area now
+    qtbot.waitUntil(lambda: sheet.field.line_edit.hasFocus(), timeout=2000)
+    QTest.keyClick(sheet.field.line_edit, Qt.Key.Key_Tab)
+    assert sheet.ok.hasFocus()  # the focus trap includes the pinned footer
+    win.resize(800, 900)
+    QApplication.processEvents()
+    assert not sheet.footer_pinned() and sheet.isAncestorOf(sheet.ok)
+    win.resize(800, 420)
+    QApplication.processEvents()
+    assert sheet.footer_pinned()
+    sheet.ok.click()  # Save closes; the footer is back in the content
+    assert not host.has_sheet() and sheet.isAncestorOf(sheet.ok)
+
+
 def test_sheet_escape_and_ctrl_enter(qtbot) -> None:  # type: ignore[no-untyped-def]
     win = _window(qtbot)
     host = SheetHost(win)
@@ -384,13 +448,32 @@ def test_toast_timeout_and_hover_pause(qtbot) -> None:  # type: ignore[no-untype
     host._on_hover(True)  # noqa: SLF001 - pointer enters: countdown paused
     assert not host._timer.isActive()  # noqa: SLF001
     host._on_hover(False)  # noqa: SLF001
-    assert host._timer.isActive()  # noqa: SLF001
+    assert host._timer.isActive() and host._timer.remainingTime() > 1000  # noqa: SLF001 - ≥ 1.5 s again
     with qtbot.waitSignal(host.expired, timeout=4000) as blocker:
-        pass
+        host._timer.start(10)  # noqa: SLF001 - skip the real 1.5 s
     assert blocker.args == [t]
     host.show("Bye")
     host.flush()
     assert not host.is_showing()
+
+
+@pytest.mark.parametrize(("first", "second"), [("dark", "light"), ("light", "dark")])
+def test_toast_restyles_live_on_theme_change(qtbot, _theme: theme.ThemeManager, first: str, second: str) -> None:  # type: ignore[no-untyped-def]
+    """A toast that stays up across a theme switch takes the new theme's label colour."""
+    from madhura.ui.widgets.toast import _toast_colors
+
+    _theme.set_theme(first)
+    win = _window(qtbot)
+    host = ToastHost(win)
+    host.show("Daily goal reached — 2h focused", "success", duration_ms=60_000)
+    label = host.widget().label
+    assert label.palette().color(label.foregroundRole()) == _toast_colors()[2]
+    _theme.set_theme(second)
+    QApplication.processEvents()
+    expected = _toast_colors()[2]
+    assert label.palette().color(label.foregroundRole()) == expected
+    assert QColor(expected).lightness() > 200  # light text on the dark pill in both themes
+    host.flush()
 
 
 # --------------------------------------------------------------------------- popover

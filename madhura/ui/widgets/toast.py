@@ -13,7 +13,7 @@ from PySide6.QtGui import QColor, QFontMetrics, QPainter, QPaintEvent
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QWidget
 
 from madhura.ui import animations, fonts, icons, theme
-from madhura.ui.widgets._common import HoverFader, fill_rounded
+from madhura.ui.widgets._common import HoverFader, connect_theme, fill_rounded
 from madhura.ui.widgets.popup import paint_shadow
 
 try:
@@ -113,6 +113,13 @@ class _ToastWidget(QWidget):
         lay.addWidget(self.action, 0, Qt.AlignmentFlag.AlignVCenter)
         self.setFixedHeight(_HEIGHT + 2 * _MARGIN)
         self.hide()
+        # Re-colour live: the app-wide QSS re-polish that follows a theme switch resets the
+        # label's palette, so a toast shown across the switch would keep the old text colour.
+        connect_theme(self, self._on_theme_changed)
+
+    def _on_theme_changed(self) -> None:
+        self._sync_palette()
+        self.update()
 
     def configure(self, text: str, kind: str, action_text: str | None) -> None:
         self.kind = kind if kind in _KIND_ICONS or kind == "info" else "info"

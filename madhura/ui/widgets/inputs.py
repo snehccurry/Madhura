@@ -253,10 +253,20 @@ class TextField(QWidget):
         return self._edit.text()
 
     def set_text(self, text: str, select: bool = False) -> None:
-        """Replace the text (optionally selecting it)."""
-        self._edit.setText(text)
-        if select:
-            self._edit.selectAll()
+        """Replace the text (optionally selecting it).
+
+        Outside editing (no focus) the beginning of a long value stays in view: QLineEdit would
+        leave the cursor — and the visible part — at the end ("…legacy settings code")."""
+        edit = self._edit
+        edit.setText(text)
+        n = len(edit.text())
+        if edit.hasFocus():
+            if select:
+                edit.selectAll()
+        elif select:
+            edit.setSelection(n, -n)  # selected, cursor (and view) at the start
+        else:
+            edit.setCursorPosition(0)
 
     def setText(self, text: str) -> None:  # noqa: N802
         self._edit.setText(text)
@@ -652,7 +662,7 @@ class Stepper(QWidget):
 
 class Slider(QSlider):
     """Themed horizontal slider; clicking the groove jumps there. ``valueReleased(int)`` fires
-    when the user lets go (e.g. play a test sound)."""
+    once each time the user lets go (e.g. play a test sound)."""
 
     valueReleased = Signal(int)
 
@@ -673,7 +683,12 @@ class Slider(QSlider):
         self.setMinimumHeight(24)
         self.setMinimumWidth(120)
         self._pressed = False
-        self.sliderReleased.connect(lambda: self.valueReleased.emit(self.value()))
+        self._release_reported = False
+        self.sliderReleased.connect(self._on_slider_released)
+
+    def _on_slider_released(self) -> None:
+        self._release_reported = True
+        self.valueReleased.emit(self.value())
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
@@ -690,10 +705,15 @@ class Slider(QSlider):
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        # A groove click moves the handle under the pointer, so QSlider usually grabs it and
+        # reports the release itself (sliderReleased); emit here only when it did not.
+        self._release_reported = False
         super().mouseReleaseEvent(event)
         if self._pressed and not self.isSliderDown():
             self._pressed = False
-            self.valueReleased.emit(self.value())
+            if not self._release_reported:
+                self.valueReleased.emit(self.value())
+        self._release_reported = False
 
 
 class WheelGuard(QObject):

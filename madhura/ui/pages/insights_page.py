@@ -963,7 +963,7 @@ class InsightsPage(PageScroll):
         if self._refresh_queued:
             return
         self._refresh_queued = True
-        QTimer.singleShot(0, self._queued_refresh)
+        QTimer.singleShot(0, self, self._queued_refresh)
 
     def _queued_refresh(self) -> None:
         if not self._refresh_queued:

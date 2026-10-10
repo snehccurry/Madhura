@@ -250,6 +250,18 @@ def test_all_done_summary(hshell: AppContext) -> None:
     assert page.summary.bar.states() == ["done", "skipped"]
 
 
+def test_summary_bar_fills_from_the_left(hshell: AppContext) -> None:
+    ctx = hshell
+    add_habit(ctx, "Early", time="07:00")
+    add_habit(ctx, "Middle", time="12:00")
+    late = add_habit(ctx, "Late", time="21:00")
+    page = habits_page(ctx)
+    page.toggle_done(late)
+    pump()
+    assert page.summary.value_text() == "1 of 3"
+    assert page.summary.bar.states() == ["done", "none", "none"]
+
+
 def test_nothing_scheduled_today_summary(hshell: AppContext) -> None:
     ctx = hshell
     add_habit(ctx, "Weekend hike", days=0b1100000)

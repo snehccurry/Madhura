@@ -2,13 +2,37 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QRectF, QSize, Qt
-from PySide6.QtGui import QColor, QPainter, QPaintEvent
+from PySide6.QtCore import QRect, QRectF, QSize, Qt
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPaintEvent
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget
 
 from madhura.ui import fonts, icons, theme
 
-__all__ = ["EmptyState", "IconMedallion"]
+__all__ = ["EmptyState", "IconMedallion", "balanced_width"]
+
+BODY_MAX_WIDTH = 400
+
+
+def balanced_width(text: str, font: QFont, max_width: int) -> int:
+    """Narrowest width (≤ *max_width*) at which *text* wraps into as few lines as at
+    *max_width* — centred copy then never ends in a one-word widow ("… appear" / "here.")."""
+    fm = QFontMetrics(font)
+    flags = int(Qt.TextFlag.TextWordWrap)
+
+    def lines(width: int) -> int:
+        return round(fm.boundingRect(QRect(0, 0, width, 100_000), flags, text).height() / max(1, fm.lineSpacing()))
+
+    count = lines(max_width)
+    if count <= 1:
+        return max_width
+    lo, hi = max(1, max_width // (count + 1)), max_width
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if lines(mid) <= count:
+            hi = mid
+        else:
+            lo = mid + 1
+    return min(max_width, hi + 4)  # a little slack for QLabel's own layout
 
 
 class IconMedallion(QWidget):
@@ -83,7 +107,7 @@ class EmptyState(QWidget):
         self._body.setFont(fonts.font(13))
         self._body.setWordWrap(True)
         self._body.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        self._body.setMaximumWidth(400)
+        self._body.setMaximumWidth(balanced_width(body, self._body.font(), BODY_MAX_WIDTH))
         self._body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self._body.setVisible(bool(body))
         body_row = QHBoxLayout()
@@ -111,6 +135,7 @@ class EmptyState(QWidget):
     def set_body(self, text: str) -> None:
         """Change the body text."""
         self._body.setText(text)
+        self._body.setMaximumWidth(balanced_width(text, self._body.font(), BODY_MAX_WIDTH))
         self._body.setVisible(bool(text))
 
     def set_icon(self, name: str) -> None:

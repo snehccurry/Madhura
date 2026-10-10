@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from PySide6.QtCore import QCoreApplication, QEvent
 from PySide6.QtWidgets import QApplication
+from test_shell_support import release_context
 
 from madhura.context import AppContext, FakeWindowController
 
@@ -30,8 +31,12 @@ def make_octx(qapp: QApplication, data_dir: Path, clock: Any, *, window: Any = N
     return ctx
 
 
-def dispose_octx(ctx: AppContext, qapp: QApplication) -> None:
-    """Shut the context down and clear global UI state (popup stack, theme, panels)."""
+def dispose_octx(ctx: AppContext, qapp: QApplication, *, release: bool = True) -> None:
+    """Shut the context down and clear global UI state (popup stack, theme, panels).
+
+    ``release=False`` keeps the services' QObjects alive (only their windows go), like an app
+    teardown that destroys widgets first; call ``release_context(ctx)`` afterwards.
+    """
     from madhura.app import shutdown
     from madhura.ui import theme
     from madhura.ui.widgets.popup import PopupStack
@@ -55,6 +60,8 @@ def dispose_octx(ctx: AppContext, qapp: QApplication) -> None:
     qapp.processEvents()
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
     qapp.processEvents()
+    if release:
+        release_context(ctx)
 
 
 @pytest.fixture

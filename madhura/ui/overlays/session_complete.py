@@ -83,10 +83,38 @@ CHECK_DRAW_MS = 400
 TOAST_TEXT_PX = 420  # ToastHost elides longer text
 _MIN_HOVER_RESUME_MS = 10_000
 
+
+class _PerContext:
+    """Mapping-like registry that keeps its value *on the context* (``ctx.flags``).
+
+    The values (sheets, panels, watchers) reference the context themselves, so a module-level
+    ``WeakKeyDictionary`` keyed by the context would never let it go; storing them on the context
+    ties their lifetime to it.
+    """
+
+    def __init__(self, name: str) -> None:
+        self._key = f"_session_complete_{name}"
+
+    def get(self, ctx: Any, default: Any = None) -> Any:
+        return ctx.flags.get(self._key, default)
+
+    def setdefault(self, ctx: Any, default: Any) -> Any:
+        return ctx.flags.setdefault(self._key, default)
+
+    def pop(self, ctx: Any, default: Any = None) -> Any:
+        return ctx.flags.pop(self._key, default)
+
+    def __setitem__(self, ctx: Any, value: Any) -> None:
+        ctx.flags[self._key] = value
+
+    def __delitem__(self, ctx: Any) -> None:
+        del ctx.flags[self._key]
+
+
 # Live sheets / panels per context (panels are parentless: this keeps them alive).
-_SHEETS: weakref.WeakKeyDictionary[Any, dict[int, SessionCompleteSheet]] = weakref.WeakKeyDictionary()
-_PANELS: weakref.WeakKeyDictionary[Any, CompletionPanel] = weakref.WeakKeyDictionary()
-_WATCHERS: weakref.WeakKeyDictionary[Any, _PendingWatcher] = weakref.WeakKeyDictionary()
+_SHEETS = _PerContext("sheets")  # ctx → {session_id: SessionCompleteSheet}
+_PANELS = _PerContext("panel")  # ctx → CompletionPanel
+_WATCHERS = _PerContext("watcher")  # ctx → _PendingWatcher
 
 
 # =========================================================================== text helpers
@@ -720,6 +748,9 @@ class CompletionPanel(FloatingPanel):
             self._ctx.engine.state_changed.disconnect(self._on_engine_state)
         except (RuntimeError, TypeError):
             pass
+        # Each completion gets a new panel: free this one (its button/timer lambdas reference it
+        # from the C++ side, so it would otherwise live on as a hidden top-level window).
+        self.deleteLater()
 
     # ------------------------------------------------------------------ actions
     def _on_primary(self) -> None:

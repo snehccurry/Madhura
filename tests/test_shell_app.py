@@ -302,6 +302,40 @@ def test_flush_data_keeps_running(shell: AppContext) -> None:  # noqa: F811
     assert snap and snap["state"] == "focus"
 
 
+def test_disposed_context_is_garbage_collected(qapp: QApplication, data_dir: Path, fake_clock: FakeClock, qtbot) -> None:  # noqa: ANN001
+    """Nothing app-wide (module registries, app/screen signal lambdas) keeps a context alive,
+    and a closed completion panel does not linger."""
+    import gc
+    import weakref
+
+    from shiboken6 import isValid
+
+    from madhura.ui.overlays import session_complete
+
+    ctx = make_shell(qapp, data_dir, fake_clock)
+    ctx.settings.update(checkin_enabled=False)
+    ctx.window.show_main()  # type: ignore[union-attr]
+    ctx.engine.start("Write", 5)
+    advance(ctx, 5 * 60)  # completes → session-complete sheet + pending watcher
+    ctx.window.hide_main()  # type: ignore[union-attr]
+    ctx.engine.start("Again", 5)  # pill shows while the window is hidden
+    advance(ctx, 5 * 60)  # completes while hidden → completion panel
+    assert str(ctx.engine.state) == "idle"
+    panel = session_complete._PANELS.get(ctx)  # noqa: SLF001
+    assert panel is not None and panel.isVisible()
+    panel.done_button.click()
+    qtbot.waitUntil(lambda: not isValid(panel), timeout=2000)  # closed → deleted
+    del panel
+    for key in ("habits", "insights", "settings"):
+        ctx.window.pages[key]  # type: ignore[union-attr]  # build every page
+    ref = weakref.ref(ctx)
+    dispose_shell(ctx, qapp)
+    del ctx
+    qapp.processEvents()  # pending zero-delay timers let go of their callbacks
+    gc.collect()
+    assert ref() is None
+
+
 def test_after_show_onboarding_and_recovered_notice(qapp: QApplication, data_dir: Path, fake_clock: FakeClock) -> None:
     ctx = make_shell(qapp, data_dir, fake_clock, onboarded=False)
     try:

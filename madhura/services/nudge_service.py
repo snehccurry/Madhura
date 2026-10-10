@@ -186,13 +186,9 @@ class NudgeService(QObject):
 
     def open_wrap_up(self) -> None:
         """Show the main window on Focus and open the WrapUpSheet."""
-        window = self._ctx.window
-        if window is None:
-            return
-        from madhura.ui.overlays.wrap_up import WrapUpSheet
+        from madhura.ui.overlays.wrap_up import open_wrap_up
 
-        window.show_main("focus")
-        window.show_sheet(WrapUpSheet(self._ctx))
+        open_wrap_up(self._ctx)
 
     # ================================================================== primary action
     def first_task(self) -> PlannedTask | None:

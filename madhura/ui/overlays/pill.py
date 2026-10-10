@@ -792,6 +792,7 @@ class PillController(QObject):
         self._override: bool | None = None
         self._showing = False
         self._done_active = False
+        self._done_settled = False  # the session_finished emission (incl. an auto-break) is over
         self._pulsed_sid: int | None = None
         self._menu: Menu | None = None
         self._done_timer = QTimer(self)
@@ -810,6 +811,7 @@ class PillController(QObject):
         engine.tick.connect(self._on_tick)
         engine.session_started.connect(self._on_session_started)
         engine.session_finished.connect(self._on_session_finished)
+        engine.break_started.connect(self._on_break_started)
         engine.session_extended.connect(lambda _s: self.refresh())
         ctx.events.main_visibility_changed.connect(lambda _v: self._update_visibility())
         ctx.attention.changed.connect(lambda _s: self._update_visibility())
@@ -818,10 +820,12 @@ class PillController(QObject):
 
         app = QGuiApplication.instance()
         if app is not None:
+            # Bound methods, not lambdas: app/screen signals outlive this controller, and a lambda
+            # would keep it (and its pill window) alive and called after it is gone.
             app.screenAdded.connect(self._on_screen_added)  # type: ignore[attr-defined]
-            app.screenRemoved.connect(lambda _s: self.restore_position())  # type: ignore[attr-defined]
+            app.screenRemoved.connect(self._on_screens_changed)  # type: ignore[attr-defined]
             for screen in QGuiApplication.screens():
-                screen.availableGeometryChanged.connect(lambda _g: self.restore_position())
+                screen.availableGeometryChanged.connect(self._on_screens_changed)
         PopupStack.instance().set_obstacle(pill)
         self.refresh()
         self.restore_position()
@@ -969,9 +973,20 @@ class PillController(QObject):
         if restored or str(outcome) not in ("completed", "ended_early") or not self._showing or not self._alive():
             return
         self._done_active = True
+        self._done_settled = False
+        QTimer.singleShot(0, self, self._settle_done)
         self._pill.set_expanded(False, animate=False)
         self.refresh()
         self._done_timer.start()
+
+    def _settle_done(self) -> None:
+        self._done_settled = True
+
+    def _on_break_started(self, _seconds: int) -> None:
+        # An auto-started break (same emission as session_finished) keeps "Done" for its 3 s;
+        # a break the user starts afterwards (completion panel / sheet) shows right away.
+        if self._done_active and self._done_settled:
+            self._end_done()
 
     def _end_done(self, update: bool = True) -> None:
         if not self._done_active:
@@ -1071,5 +1086,8 @@ class PillController(QObject):
             log.exception("Could not save the mini timer position")
 
     def _on_screen_added(self, screen: QScreen) -> None:
-        screen.availableGeometryChanged.connect(lambda _g: self.restore_position())
+        screen.availableGeometryChanged.connect(self._on_screens_changed)
+        self.restore_position()
+
+    def _on_screens_changed(self, *_args: object) -> None:
         self.restore_position()

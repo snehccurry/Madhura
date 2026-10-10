@@ -3,7 +3,8 @@
 Responsibilities (spec §5.1, §5.2, §7.4, §8, §1.13):
 
 * four pages in a QStackedWidget (fade on switch, ``on_shown()`` after every switch / show),
-  ``events.navigate`` handling, sidebar collapse below 1000 px;
+  each built on first use (only the Focus page at startup), ``events.navigate`` handling,
+  sidebar collapse below 1000 px;
 * in-window sheets (FIFO via :class:`SheetHost`) and toasts (:class:`ToastHost`);
 * global shortcuts (disabled while a sheet is open; Space is left to the Focus page);
 * ``main_visibility_changed`` emission, geometry persistence (kv 'window_geometry'),
@@ -15,7 +16,7 @@ from __future__ import annotations
 import importlib
 import logging
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
 from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QElapsedTimer, QEvent, QRect, QSize, Qt
@@ -53,6 +54,41 @@ _PAGE_CLASSES: dict[str, tuple[str, str]] = {
     "insights": ("madhura.ui.pages.insights_page", "InsightsPage"),
     "settings": ("madhura.ui.pages.settings_page", "SettingsPage"),
 }
+
+
+class _LazyPages(Mapping[str, QWidget]):
+    """``MainWindow.pages``: always has every page key; a page is built (and added to the stack)
+    on first access, so startup only pays for the Focus page."""
+
+    def __init__(self, create: Callable[[str], QWidget]) -> None:
+        self._create = create
+        self._built: dict[str, QWidget] = {}
+        self._building: set[str] = set()
+
+    def __getitem__(self, key: str) -> QWidget:
+        page = self._built.get(key)
+        if page is None:
+            if key not in PAGE_KEYS or key in self._building:  # unknown, or asked for while being built
+                raise KeyError(key)
+            self._building.add(key)
+            try:
+                page = self._built[key] = self._create(key)
+            finally:
+                self._building.discard(key)
+        return page
+
+    def __contains__(self, key: object) -> bool:
+        return key in PAGE_KEYS
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(PAGE_KEYS)
+
+    def __len__(self) -> int:
+        return len(PAGE_KEYS)
+
+    def is_built(self, key: str) -> bool:
+        """True once page *key* exists."""
+        return key in self._built
 
 
 def validate_geometry(data: Any, screens: list[QRect]) -> tuple[QRect, bool] | None:
@@ -107,11 +143,7 @@ class MainWindow(QMainWindow):
         row.addWidget(self.stack, 1)
         self.setCentralWidget(central)
 
-        self.pages: dict[str, QWidget] = {}
-        for key in PAGE_KEYS:
-            page = self._build_page(key)
-            self.pages[key] = page
-            self.stack.addWidget(page)
+        self.pages: Mapping[str, QWidget] = _LazyPages(self._add_page)
         self._current = PAGE_KEYS[0]
         self.stack.setCurrentWidget(self.pages[self._current])
 
@@ -130,6 +162,11 @@ class MainWindow(QMainWindow):
         self._restore_geometry()
 
     # ================================================================== pages
+
+    def _add_page(self, key: str) -> QWidget:
+        page = self._build_page(key)
+        self.stack.addWidget(page)
+        return page
 
     def _build_page(self, key: str) -> QWidget:
         module_name, class_name = _PAGE_CLASSES[key]
@@ -157,9 +194,16 @@ class MainWindow(QMainWindow):
         old = self.pages.get(self._current)
         self._current = key
         page = self.pages[key]
-        animations.cross_fade(self.stack, self.stack.indexOf(page), PAGE_FADE_MS)
         fw = QApplication.focusWidget()
-        if fw is None or (old is not None and old.isAncestorOf(fw)) or not fw.isVisible():
+        # Focus inside (or on) the outgoing page goes to the new page itself. Parked on the stack
+        # meanwhile: the stack would hand it to the new page's first control (which on_shown may
+        # hide, e.g. the Insights range control in the empty state), and Qt then passes focus on
+        # with a Tab reason — lighting a keyboard focus ring nobody asked for.
+        move_focus = fw is None or (old is not None and (fw is old or old.isAncestorOf(fw))) or not fw.isVisible()
+        if move_focus:
+            self.stack.setFocus(Qt.FocusReason.OtherFocusReason)
+        animations.cross_fade(self.stack, self.stack.indexOf(page), PAGE_FADE_MS)
+        if move_focus:
             page.setFocus(Qt.FocusReason.OtherFocusReason)
         self._notify_shown(page)
 

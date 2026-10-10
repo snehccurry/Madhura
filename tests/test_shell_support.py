@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from PySide6.QtCore import QCoreApplication, QEvent
+from PySide6.QtCore import QCoreApplication, QEvent, QObject
 from PySide6.QtWidgets import QApplication
 
 from madhura.context import AppContext
@@ -44,6 +44,32 @@ def make_shell(
     return ctx
 
 
+def release_context(ctx: AppContext) -> None:
+    """Delete a shut-down context's QObjects (services, engine, settings, events, …).
+
+    Lambdas connected to their signals are referenced from the C++ side, where the garbage
+    collector cannot see them, so without this every context (and its window) stays alive for
+    the rest of the run.
+    """
+    from shiboken6 import isValid
+
+    from madhura.ui import theme
+
+    if theme._current is ctx.theme:  # noqa: SLF001
+        theme.set_current(None)
+    pill_window = getattr(ctx.pill, "pill", None)  # parentless, owned by the controller
+    if isinstance(pill_window, QObject) and isValid(pill_window):
+        pill_window.hide()
+        pill_window.deleteLater()
+    names = ("pill", "checkins", "nudges", "away", "habit_reminders", "day_watcher", "tray",
+             "engine", "attention", "sound", "notifier", "settings", "theme", "events")
+    for name in names:
+        obj = getattr(ctx, name, None)
+        if isinstance(obj, QObject) and isValid(obj):
+            obj.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
 def dispose_shell(ctx: AppContext, qapp: QApplication) -> None:
     """Shut the context down and destroy its window / global UI state."""
     from madhura.app import shutdown
@@ -59,12 +85,13 @@ def dispose_shell(ctx: AppContext, qapp: QApplication) -> None:
     if ctx.tray is not None:
         ctx.tray.hide()
     PopupStack.reset()
-    theme.set_current(None)
-    qapp.setStyleSheet("")
     qapp.processEvents()
     # processEvents() does not run deleteLater(); without this, dead windows pile up and every
-    # later app.setStyleSheet() re-polishes them.
+    # later app.setStyleSheet() re-polishes them (so delete before clearing the QSS below).
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    release_context(ctx)
+    theme.set_current(None)
+    qapp.setStyleSheet("")
     qapp.processEvents()
 
 

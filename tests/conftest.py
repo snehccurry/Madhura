@@ -7,7 +7,9 @@ Every test gets its own MADHURA_DATA_DIR under tmp_path.
 
 from __future__ import annotations
 
+import gc
 import os
+import sys
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 os.environ["MADHURA_NO_SINGLE_INSTANCE"] = "1"
@@ -29,6 +31,56 @@ if TYPE_CHECKING:
 
 #: Wednesday 2026-10-14 10:00 local — the canonical "now" for tests.
 FAKE_NOW = datetime(2026, 10, 14, 10, 0, 0)
+
+
+def pytest_collection_finish(session: pytest.Session) -> None:
+    """Move everything alive after collection (modules, Qt bindings, test functions) out of the
+    garbage collector's reach so the per-test ``gc.collect()`` below only scans test objects."""
+    gc.collect()
+    gc.freeze()
+
+
+@pytest.fixture(autouse=True)
+def _qt_hygiene() -> Iterator[None]:
+    """Leave no Qt state behind: after every test (and after its own fixtures' teardown) drop the
+    popup stack, hide open popups, delete every leftover parentless window (pills, panels, main
+    windows), collect garbage at a safe point and run the resulting deferred deletes.
+
+    Without this, windows from earlier tests pile up — each theme/QSS change re-polishes all of
+    them (the suite slowed down quadratically) — and cyclic garbage holding Qt objects is
+    collected at random moments, possibly inside a later test's signal emission.
+    """
+    yield
+    if "PySide6.QtWidgets" not in sys.modules:
+        return
+    from PySide6.QtCore import QCoreApplication, QEvent, Qt
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is None:
+        return
+    popup = sys.modules.get("madhura.ui.widgets.popup")
+    if popup is not None:
+        popup.PopupStack.reset()
+    for w in QApplication.topLevelWidgets():
+        # Only real windows. Popup-type windows (QCompleter popups, menus) are owned by their
+        # completer/menu object even though they have no parent: deleting one here would leave
+        # its owner with a dangling pointer that it deletes again later (segfault).
+        if w.windowType() == Qt.WindowType.Popup:
+            if w.isVisible():
+                w.hide()  # an open popup would grab the mouse in the next tests
+        elif w.parent() is None:
+            w.hide()
+            w.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    gc.collect()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    gc.freeze()  # survivors are long-lived (modules, caches): keep the next collection small
+    theme = sys.modules.get("madhura.ui.theme")
+    if theme is not None:
+        theme.set_current(None)
+    if app.styleSheet():
+        app.setStyleSheet("")
 
 
 @pytest.fixture(autouse=True)

@@ -108,6 +108,9 @@ def test_undo_queue_fallback_timer_commits(qtbot, repo) -> None:  # noqa: ANN001
     done: list[str] = []
     q.push("Deleted", lambda: done.append("commit"), lambda: done.append("undo"), duration_ms=1000)
     assert fake.toasts == [("Deleted", "info", "Undo")] and q.pending_count() == 1
+    timer = q._pending[0].timer  # noqa: SLF001 - commits a little after the toast would expire
+    assert timer is not None and timer.isActive() and timer.interval() == 1250
+    timer.start(10)  # don't wait the real 1.25 s
     qtbot.waitUntil(lambda: done == ["commit"], timeout=3000)
     assert q.pending_count() == 0
     q.push("Again", lambda: done.append("commit2"), lambda: done.append("undo2"))

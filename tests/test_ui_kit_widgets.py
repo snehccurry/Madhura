@@ -9,7 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
 from PySide6.QtCore import QPoint, QPointF, Qt  # noqa: E402
-from PySide6.QtGui import QWheelEvent  # noqa: E402
+from PySide6.QtGui import QColor, QImage, QRegion, QWheelEvent  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget  # noqa: E402
 
@@ -247,6 +247,38 @@ def test_toggle(qtbot) -> None:  # type: ignore[no-untyped-def]
     assert t.accessibleName() == "Check-ins"
 
 
+def _contrast(a: QColor, b: QColor) -> float:
+    def lum(c: QColor) -> float:
+        def ch(v: float) -> float:
+            return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+
+        return 0.2126 * ch(c.redF()) + 0.7152 * ch(c.greenF()) + 0.0722 * ch(c.blueF())
+
+    hi, lo = sorted((lum(a), lum(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+@pytest.mark.parametrize("scheme", ["dark", "light"])
+def test_disabled_toggle_stays_visible(qtbot, _theme: theme.ThemeManager, scheme: str) -> None:  # type: ignore[no-untyped-def]
+    """A disabled switch keeps a visible outline/knob on the card surface in both themes, and
+    on/off remain distinguishable."""
+    _theme.set_theme(scheme)
+    surface = QColor(theme.palette().surface)
+    off, on = Toggle(False), Toggle(True)
+    _host(qtbot, off, on)
+    images = []
+    for t in (off, on):
+        t.setEnabled(False)
+        img = QImage(t.size(), QImage.Format.Format_ARGB32)
+        img.fill(surface)
+        t.render(img, QPoint(), QRegion(), QWidget.RenderFlag(0))
+        images.append(img)
+        best = max(_contrast(QColor(img.pixel(x, y)), surface) for x in range(img.width()) for y in range(img.height()))
+        assert best >= 1.6, (scheme, t.isChecked(), best)
+    mid = QPoint(8, off.height() // 2)  # left of the "on" knob, on the "off" knob
+    assert images[0].pixelColor(mid) != images[1].pixelColor(mid)
+
+
 def test_checkbox(qtbot) -> None:  # type: ignore[no-untyped-def]
     c = Checkbox(True, box=28)
     s = Checkbox(text="Mark done", checked=True)
@@ -387,7 +419,31 @@ def test_slider_and_wheel_guard(qtbot, qapp: QApplication) -> None:  # type: ign
     wheel()
     assert s.value() != 40
     qtbot.mouseClick(s, Qt.MouseButton.LeftButton, pos=QPoint(s.width() - 4, s.height() // 2))
-    assert released and s.value() > 80
+    assert released == [s.value()] and s.value() > 80  # groove click: exactly one release
+
+
+def test_slider_reports_each_release_once(qtbot) -> None:  # type: ignore[no-untyped-def]
+    s = Slider(0, 100, 40)
+    _host(qtbot, s)
+    released: list[int] = []
+    s.valueReleased.connect(released.append)
+    y = s.height() // 2
+    qtbot.mouseClick(s, Qt.MouseButton.LeftButton, pos=QPoint(s.width() // 4, y))  # groove → jump
+    assert len(released) == 1 and released[-1] == s.value() < 40
+    from PySide6.QtWidgets import QStyle, QStyleOptionSlider
+
+    opt = QStyleOptionSlider()
+    s.initStyleOption(opt)
+    handle = s.style().subControlRect(QStyle.ComplexControl.CC_Slider, opt, QStyle.SubControl.SC_SliderHandle, s)
+    qtbot.mousePress(s, Qt.MouseButton.LeftButton, pos=handle.center())  # grab the handle and drag
+    qtbot.mouseMove(s, QPoint(s.width() - 6, y))
+    assert len(released) == 1  # nothing while dragging
+    qtbot.mouseRelease(s, Qt.MouseButton.LeftButton, pos=QPoint(s.width() - 6, y))
+    assert len(released) == 2 and released[-1] == s.value() > 80
+    qtbot.mouseClick(s, Qt.MouseButton.RightButton, pos=QPoint(s.width() // 2, y))
+    s.setSliderDown(True)
+    s.setSliderDown(False)  # programmatic release still reports once
+    assert len(released) == 3
 
 
 def test_select(qtbot) -> None:  # type: ignore[no-untyped-def]
@@ -545,3 +601,22 @@ def test_empty_state_and_page(qtbot) -> None:  # type: ignore[no-untyped-def]
     header.set_subtitle(None)
     es.set_body("x")
     page.scroll_to_top()
+
+
+def test_text_field_programmatic_value_shows_its_beginning(qtbot) -> None:  # type: ignore[no-untyped-def]
+    """A long prefilled value (e.g. the break view's next block) starts at its first word."""
+    from madhura.ui.widgets import TextField
+
+    field = TextField("Next")
+    qtbot.addWidget(field)
+    field.resize(160, 40)
+    title = "Refactor the onboarding flow and remove the legacy settings code"
+    field.set_text(title)
+    assert field.line_edit.cursorPosition() == 0
+    field.set_text(title, select=True)
+    assert field.line_edit.selectedText() == title and field.line_edit.cursorPosition() == 0
+    field.show()
+    field.line_edit.setFocus()
+    qtbot.waitUntil(field.line_edit.hasFocus, timeout=1000)
+    field.set_text("Typing goes on", select=False)
+    assert field.line_edit.cursorPosition() == len("Typing goes on")  # editing: Qt's default

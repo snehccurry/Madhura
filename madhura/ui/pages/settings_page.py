@@ -23,7 +23,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import QElapsedTimer, QEvent, QStandardPaths, Qt, QTimer
+from PySide6.QtCore import QEvent, QStandardPaths, Qt, QTimer
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
 from madhura import __version__
@@ -89,7 +89,6 @@ _SOUND_ROWS = (
     ("sound_nudge", "Nudges", "Gentle nudges stay silent unless this is on."),
 )
 _KEYBOARD_TEST_DELAY_MS = 450
-_RELEASE_DEDUPE_MS = 300
 _SELECT_MIN_WIDTH = 136
 _ACTION_MIN_WIDTH = 128
 _MENU_LIMIT = 8
@@ -410,8 +409,6 @@ class SettingsPage(PageScroll):
         self._test_timer.setSingleShot(True)
         self._test_timer.setInterval(_KEYBOARD_TEST_DELAY_MS)
         self._test_timer.timeout.connect(self.play_test_sound)
-        self._released = QElapsedTimer()
-        self._released_value = -1
         self.volume_slider.valueChanged.connect(self._on_volume_changed)
         self.volume_slider.valueReleased.connect(self._on_volume_released)
         self.test_sound_button.clicked.connect(self.play_test_sound)
@@ -446,11 +443,6 @@ class SettingsPage(PageScroll):
     def _on_volume_released(self, value: int) -> None:
         self._test_timer.stop()
         self._set("sound_volume", int(value))
-        # The kit Slider can report one release twice (sliderReleased + its own release handler).
-        if self._released.isValid() and self._released.elapsed() < _RELEASE_DEDUPE_MS and self._released_value == value:
-            return
-        self._released.start()
-        self._released_value = int(value)
         self.play_test_sound()
 
     def play_test_sound(self) -> None:

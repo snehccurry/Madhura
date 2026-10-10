@@ -13,6 +13,7 @@ from test_o_support import (  # noqa: F401
     dispose_octx,
     make_octx,
     octx,
+    release_context,
     set_attention,
 )
 
@@ -479,6 +480,20 @@ def test_done_then_auto_break_shows_the_break(octx: AppContext) -> None:  # noqa
     assert pc.is_showing() and pc.pill.mode() == "break"
 
 
+def test_break_started_after_done_shows_the_break_at_once(octx: AppContext) -> None:  # noqa: F811
+    """"Take a break" on the completion panel / sheet: the pill switches to the break at once
+    (an auto-started break, in the same emission as the finish, keeps "Done" for 3 s)."""
+    pc = octx.pill
+    octx.settings.update(checkin_enabled=False)
+    octx.engine.start("Write", 25)
+    advance(octx, 25 * 60, 30)
+    assert pc.pill.mode() == "done"
+    QApplication.processEvents()  # the session_finished emission is over
+    octx.engine.start_break(5)
+    assert pc.is_showing() and not pc.is_done_showing()
+    assert pc.pill.mode() == "break"
+
+
 def test_abandon_hides_without_done(octx: AppContext) -> None:  # noqa: F811
     octx.engine.start("Write", 25)
     octx.engine.abandon()
@@ -520,10 +535,11 @@ def test_pill_survives_teardown(qapp: QApplication, data_dir: Any, fake_clock: A
     ctx = make_octx(qapp, data_dir, fake_clock)
     pc = ctx.pill
     ctx.engine.start("Write", 60)
-    dispose_octx(ctx, qapp)
+    dispose_octx(ctx, qapp, release=False)
     pc.refresh()
     pc.restore_position()
     pc._end_done()  # noqa: SLF001 - nothing raises once the widget is gone
+    release_context(ctx)
 
 
 def test_showing_the_pill_never_takes_focus_from_our_window(octx: AppContext, qtbot: Any) -> None:  # noqa: F811

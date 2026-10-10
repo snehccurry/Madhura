@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from madhura.context import AppContext
-from madhura.ui.overlays.wrap_up import WrapUpSheet, next_day_word
+from madhura.ui.overlays.wrap_up import WrapUpSheet, next_day_word, open_wrap_up
 from test_i_support import TODAY, add_session, ictx, no_summary, pump, show, win_of  # noqa: F401
 
 THU = date(2026, 10, 15)
@@ -262,3 +262,23 @@ def test_works_without_nudge_service(ictx: AppContext) -> None:
     sheet.shutdown()
     pump()
     assert not win_of(ictx).has_sheet()
+
+
+def test_open_wrap_up_reuses_an_open_or_queued_sheet(wctx: AppContext) -> None:
+    """Footer link, tray menu and the after-work prompt never stack two wrap-up sheets."""
+    from madhura.ui.widgets.sheet import ConfirmSheet
+
+    win = win_of(wctx)
+    blocker = ConfirmSheet("Something else", "First in the queue")
+    win.show_sheet(blocker)
+    first = open_wrap_up(wctx)
+    assert open_wrap_up(wctx) is first  # queued → reused
+    assert sum(isinstance(s, WrapUpSheet) for s in win.sheet_host.queued()) == 1
+    blocker.reject()
+    pump()
+    assert win.sheet_host.current() is first
+    assert open_wrap_up(wctx, show_main=False) is first  # open → reused
+    assert not win.sheet_host.queued()
+    first.close_sheet()
+    pump()
+    assert open_wrap_up(wctx) is not first

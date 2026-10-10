@@ -53,6 +53,8 @@ def test_focus_never_falls_onto_active_buttons(focus: AppContext) -> None:  # no
 
 
 def test_session_finished_routes_to_summary_exactly_once(focus: AppContext, no_summary: list[Any]) -> None:  # noqa: F811
+    # Nobody answers check-ins here; with them on, two misses would pause the session (§1.5).
+    focus.settings.update(checkin_enabled=False)
     sid = focus.engine.start("Write", 25)
     advance(focus, 25 * 60)
     assert str(focus.engine.state) == "idle"
@@ -226,16 +228,25 @@ def test_start_from_input_and_focus_task_input_by_state(focus: AppContext, monke
 # =========================================================================== after_start "mini"
 
 
+_FAST_HIDE_MS = 20
+
+
+def _fast_mini_timer(ctx: AppContext) -> None:
+    """The hide runs 900 ms after Lock in; shorten that real-time wait for the tests."""
+    timer = page_of(ctx)._mini_timer  # noqa: SLF001
+    assert timer.interval() == AFTER_START_HIDE_MS and timer.isSingleShot()
+    timer.setInterval(_FAST_HIDE_MS)
+
+
 def test_after_start_mini_hides_window(tray_focus: AppContext, qtbot) -> None:  # noqa: F811, ANN001
     ctx = tray_focus
     assert ctx.settings.get("after_start") == "mini"
+    _fast_mini_timer(ctx)
     win = win_of(ctx)
     card = page_of(ctx).idle_view.plan_card
     card.task_field.set_text("Deep work")
     card.start()
-    assert win.isVisible()
-    qtbot.wait(AFTER_START_HIDE_MS - 400)
-    assert win.isVisible()  # still sweeping the arc
+    assert win.isVisible() and page_of(ctx)._mini_timer.isActive()  # noqa: SLF001 - still sweeping the arc
     qtbot.waitUntil(lambda: not win.isVisible(), timeout=2000)
     assert str(ctx.engine.state) == "focus"
 
@@ -243,25 +254,27 @@ def test_after_start_mini_hides_window(tray_focus: AppContext, qtbot) -> None:  
 def test_after_start_stay_keeps_window(tray_focus: AppContext, qtbot) -> None:  # noqa: F811, ANN001
     ctx = tray_focus
     ctx.settings.update(after_start="stay")
+    _fast_mini_timer(ctx)
     win = win_of(ctx)
     ctx.engine.start("Deep work", 25)
-    qtbot.wait(AFTER_START_HIDE_MS + 200)
+    qtbot.wait(_FAST_HIDE_MS * 4)
     assert win.isVisible()
 
 
 def test_after_start_mini_skipped_when_paused_or_hidden(tray_focus: AppContext, qtbot) -> None:  # noqa: F811, ANN001
     ctx = tray_focus
+    _fast_mini_timer(ctx)
     win = win_of(ctx)
     ctx.engine.start("Deep work", 25)
     ctx.engine.pause()  # user paused within the 900 ms
-    qtbot.wait(AFTER_START_HIDE_MS + 200)
+    qtbot.wait(_FAST_HIDE_MS * 4)
     assert win.isVisible()
     ctx.engine.abandon()
     win.hide()
     hides = []
     win.hide_main = lambda: hides.append(1)  # type: ignore[method-assign]
     ctx.engine.start("Started from the pill", 25)
-    qtbot.wait(AFTER_START_HIDE_MS + 200)
+    qtbot.wait(_FAST_HIDE_MS * 4)
     assert hides == []
 
 

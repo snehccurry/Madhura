@@ -34,7 +34,6 @@ from madhura.ui.shortcuts_sheet import ShortcutsSheet
 from madhura.ui.widgets.sheet import ConfirmSheet
 
 K = Qt.Key
-_DEDUPE_WAIT_MS = 600
 
 
 def _get(ctx: AppContext, k: str) -> object:
@@ -227,17 +226,19 @@ def test_volume_slider_plays_test_on_release(s_shell: AppContext, monkeypatch: p
     assert played == []  # not while dragging
     slider.setSliderDown(False)  # sliderReleased → valueReleased
     assert played == ["test"]
-    # Keyboard: the test sound plays once the value settles.
+    # Keyboard: the test sound plays once the value settles (450 ms; shortened here).
+    assert page._test_timer.interval() == sp._KEYBOARD_TEST_DELAY_MS  # noqa: SLF001
+    page._test_timer.setInterval(5)  # noqa: SLF001
     slider.setFocus()
     key(slider, K.Key_Right)
     assert _get(s_shell, "sound_volume") == 71
+    assert played == ["test"] and page._test_timer.isActive()  # noqa: SLF001
     qtbot.waitUntil(lambda: len(played) == 2, timeout=2000)
     # Clicking the groove jumps and plays on release.
     qtbot.mouseClick(slider, Qt.MouseButton.LeftButton, pos=QPoint(slider.width() // 4, slider.height() // 2))
     assert 5 < _get(s_shell, "sound_volume") < 40
     assert played == ["test"] * 3  # exactly one chime per release
-    qtbot.wait(_DEDUPE_WAIT_MS)
-    assert played == ["test"] * 3  # and no late keyboard-path chime either
+    assert not page._test_timer.isActive()  # noqa: SLF001 - and no late keyboard-path chime either
 
 
 def test_test_button_and_muted_volume(s_shell: AppContext, monkeypatch: pytest.MonkeyPatch, qtbot) -> None:

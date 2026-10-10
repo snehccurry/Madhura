@@ -283,13 +283,9 @@ class Tray(QObject):
             self._ctx.nudges.snooze(30)
 
     def _wrap_up(self) -> None:
-        window = self._ctx.window
-        if window is None:
-            return
-        from madhura.ui.overlays.wrap_up import WrapUpSheet
+        from madhura.ui.overlays.wrap_up import open_wrap_up
 
-        window.show_main("focus", activate=True)
-        window.show_sheet(WrapUpSheet(self._ctx))
+        open_wrap_up(self._ctx)
 
     def _quit(self) -> None:
         if self._ctx.window is not None:

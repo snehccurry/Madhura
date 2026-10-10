@@ -2066,12 +2066,9 @@ class IdleView(PageScroll):
 
     def open_wrap_up(self) -> None:
         """Open the WrapUpSheet."""
-        window = self._ctx.window
-        if window is None:
-            return
-        from madhura.ui.overlays.wrap_up import WrapUpSheet
+        from madhura.ui.overlays.wrap_up import open_wrap_up
 
-        window.show_sheet(WrapUpSheet(self._ctx))
+        open_wrap_up(self._ctx, show_main=False)
 
     def flush_pending(self) -> None:
         """Commit pending undo actions now."""
