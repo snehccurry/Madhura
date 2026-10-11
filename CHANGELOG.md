@@ -66,6 +66,7 @@ Windows build produced by CI.
 - A hidden **`--self-test [REPORT]`** flag that checks an install or build headlessly.
 - **`pip install .`** support with a `madhura` command; `python -m madhura`.
 - **Development:** about 1,400 automated tests, CI on Linux (Python 3.10 and 3.13) and Windows, deterministic screenshot (`tools/screenshots.py`) and demo-data (`tools/seed_demo.py`) tools, and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+- **Bundled typeface:** Inter (SIL OFL 1.1) ships with the app and is used on Linux and macOS, so the layout looks the same whether or not Inter is installed. Windows keeps Segoe UI.
 
 ### Changed
 

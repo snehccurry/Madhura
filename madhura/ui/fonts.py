@@ -4,16 +4,23 @@ Family preference (spec §8):
 
 * Windows 11 → "Segoe UI Variable Display" for sizes ≥ 20 px, "Segoe UI Variable Text" below.
 * Windows 10 → "Segoe UI" (weight 500 is mapped to 600 because the static family has no Medium).
-* Elsewhere → "Inter" (plus "Inter Display" for large sizes when installed), then the system default.
+* Elsewhere → "Inter" (plus "Inter Display" for large sizes), then the system default. Inter is
+  bundled in ``madhura/assets/fonts`` (SIL OFL 1.1) and registered on first use, so Linux and
+  macOS get the typography the layouts were designed for even when Inter isn't installed.
 
 All sizes are in *pixels* so text scales with the device pixel ratio, not the font DPI setting.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from PySide6.QtGui import QFont, QFontDatabase, QFontMetrics, QGuiApplication
+
+from madhura import paths
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "DISPLAY_THRESHOLD_PX",
@@ -26,6 +33,7 @@ __all__ = [
     "role_font",
     "set_tabular",
     "apply_app_font",
+    "register_bundled_fonts",
     "reserve_width",
     "reset_cache",
 ]
@@ -58,6 +66,27 @@ class FontFamilies:
 
 
 _cache: FontFamilies | None = None
+_bundled_registered = False
+
+
+def register_bundled_fonts() -> int:
+    """Register the bundled Inter fonts with Qt (once per process); returns how many loaded.
+
+    Needs a QGuiApplication. Missing or unreadable files are logged and skipped, so a build
+    without the fonts (the Windows one, which uses Segoe UI) simply falls back.
+    """
+    global _bundled_registered
+    if _bundled_registered or QGuiApplication.instance() is None:
+        return 0
+    _bundled_registered = True
+    folder = paths.asset("fonts")
+    loaded = 0
+    for path in sorted(folder.glob("*.otf")) if folder.is_dir() else []:
+        if QFontDatabase.addApplicationFont(str(path)) >= 0:
+            loaded += 1
+        else:
+            log.warning("Could not load bundled font %s", path.name)
+    return loaded
 
 
 def reset_cache() -> None:
@@ -75,6 +104,8 @@ def families() -> FontFamilies:
         # No font database yet: answer optimistically without caching.
         return FontFamilies("Inter", "Inter", "inter")
     available = set(QFontDatabase.families())
+    if "Segoe UI" not in available and register_bundled_fonts():
+        available = set(QFontDatabase.families())
     if "Segoe UI Variable Text" in available and "Segoe UI Variable Display" in available:
         result = FontFamilies("Segoe UI Variable Text", "Segoe UI Variable Display", "segoe_variable")
     elif "Segoe UI" in available:

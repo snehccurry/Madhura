@@ -263,6 +263,22 @@ def test_spec_drops_only_unused_qt_files(spec: SimpleNamespace, dest: str, unuse
     assert spec.ns["_unused_qt"](dest) is unused
 
 
+@pytest.mark.parametrize(
+    ("dest", "platform", "unused"),
+    [
+        ("madhura\\assets\\fonts\\Inter-Regular.otf", "win32", True),
+        ("madhura/assets/fonts/OFL.txt", "win32", True),
+        ("madhura/assets/fonts/Inter-Regular.otf", "linux", False),
+        ("madhura/assets/fonts/InterDisplay-Light.otf", "darwin", False),
+        ("madhura\\assets\\sounds\\chime.wav", "win32", False),
+        ("madhura\\assets\\icon.ico", "win32", False),
+    ],
+)
+def test_spec_leaves_inter_out_of_the_windows_build(spec: SimpleNamespace, dest: str, platform: str, unused: bool) -> None:
+    """Windows renders with Segoe UI, so the bundled Inter fonts would only add weight there."""
+    assert spec.ns["_unused_asset"](dest, platform) is unused
+
+
 def test_spec_version_numbers(spec: SimpleNamespace) -> None:
     ns = spec.ns
     assert ns["_version_tuple"]("2.0.0") == (2, 0, 0, 0)

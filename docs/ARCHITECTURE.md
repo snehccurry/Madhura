@@ -329,7 +329,10 @@ with the day mask applying to the start day.
 - **Type and spacing:** display 60/300 · h1 24/600 · h2 16/600 · body 14 · label 13/600 ·
   caption 12 · micro 11/600 uppercase. Spacing on a 4/8 grid. Radii: card 12, control 8, popup 14,
   sheet 16, chips and pills fully round. Fonts (`ui/fonts.py`): Segoe UI Variable on Windows 11,
-  Segoe UI on Windows 10, otherwise Inter, then the system font. Timers use tabular digits.
+  Segoe UI on Windows 10, otherwise Inter, then the system font. Inter (SIL OFL 1.1) ships in
+  `madhura/assets/fonts` and is registered on first use wherever Segoe UI is missing, so Linux and
+  macOS get the metrics the layouts were tuned for; the Windows build leaves it out. Timers use
+  tabular digits.
 - **Icons** (`ui/icons.py`) are small stroke SVGs rendered by a `QIconEngine` at the device pixel
   ratio (crisp at 125–175 %), cached per (name, color, size, dpr) and cleared on theme change.
 - **Motion** (`ui/animations.py`): 160–240 ms OutCubic. *Reduce motion* turns animations off or

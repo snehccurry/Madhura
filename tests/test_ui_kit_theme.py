@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
 from PySide6.QtCore import QSize  # noqa: E402
-from PySide6.QtGui import QColor, QFont, QIcon, QImage  # noqa: E402
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QImage  # noqa: E402
 from PySide6.QtWidgets import QApplication, QLabel, QStackedWidget, QWidget  # noqa: E402
 
 from madhura.ui import animations, fonts, icons, theme  # noqa: E402
@@ -183,6 +184,21 @@ def test_fonts() -> None:
     if hasattr(QFont, "Tag"):
         assert fonts.font(13, tabular=True).featureValue(QFont.Tag("tnum")) == 1
     assert fonts.reserve_width(fonts.font(13), "00:00") > 0
+
+
+def test_bundled_inter_covers_every_weight_the_kit_uses() -> None:
+    """Without Segoe UI the layouts are tuned for Inter, so it ships with the app (OFL)."""
+    folder = Path(fonts.paths.asset("fonts"))
+    assert (folder / "OFL.txt").is_file()
+    files = {p.stem for p in folder.glob("*.otf")}
+    assert {"Inter-Regular", "Inter-Medium", "Inter-SemiBold", "Inter-Bold"} <= files  # text 400–700
+    assert {"InterDisplay-Light", "InterDisplay-Regular", "InterDisplay-SemiBold"} <= files  # ≥ 20 px
+    fonts.register_bundled_fonts()
+    available = set(QFontDatabase.families())
+    assert {"Inter", "Inter Display"} <= available
+    if "Segoe UI" not in available:
+        fonts.reset_cache()
+        assert fonts.families() == fonts.FontFamilies("Inter", "Inter Display", "inter")
 
 
 def test_segoe_weight_mapping(monkeypatch: pytest.MonkeyPatch) -> None:

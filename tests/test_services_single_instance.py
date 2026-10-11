@@ -133,3 +133,34 @@ def test_second_launch_waits_for_a_starting_primary(qtbot, enabled, data_dir: Pa
         qtbot.waitUntil(lambda: shows == [True], timeout=5_000)
     finally:
         holder.release()
+
+
+def test_second_launch_retries_any_connect_error(qtbot, enabled, data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A starting primary's pipe can fail with errors other than ServerNotFound on Windows; the
+    racing launch must keep retrying until the deadline rather than report "did not respond"."""
+    from madhura.services import single_instance as si
+
+    holder = SingleInstance()
+    shows: list[bool] = []
+    holder.show_requested.connect(lambda: shows.append(True))
+    real = si.QLocalSocket
+    attempts: list[int] = []
+
+    class Flaky(real):  # type: ignore[misc, valid-type]
+        def waitForConnected(self, msecs: int = 30_000) -> bool:  # noqa: N802 - Qt override
+            attempts.append(1)
+            return False if len(attempts) <= 2 else super().waitForConnected(msecs)
+
+        def error(self):  # type: ignore[no-untyped-def]
+            return real.LocalSocketError.UnknownSocketError if len(attempts) <= 2 else super().error()
+
+    try:
+        assert holder.acquire() is InstanceStatus.PRIMARY
+        monkeypatch.setattr(si, "QLocalSocket", Flaky)
+        monkeypatch.setattr(si.time, "sleep", lambda _s: None)
+        second = SingleInstance()
+        assert second.acquire() is InstanceStatus.SIGNALED
+        assert len(attempts) == 3
+        qtbot.waitUntil(lambda: shows == [True], timeout=5_000)
+    finally:
+        holder.release()

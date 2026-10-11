@@ -113,6 +113,13 @@ def _unused_qt(dest: str) -> bool:
     return bool(re.match(r"(lib)?qt6pdf[.d]", name))
 
 
+def _unused_asset(dest: str, platform: str = sys.platform) -> bool:
+    """True for bundled Madhura assets this platform never loads: Windows uses Segoe UI, so the
+    Inter fonts in ``madhura/assets/fonts`` (registered only when Segoe UI is absent) stay out."""
+    path = dest.replace("\\", "/").lower()
+    return platform == "win32" and path.startswith("madhura/assets/fonts/")
+
+
 VERSION = _version()
 #: Executable icon (PyInstaller embeds one on Windows and macOS only).
 ICON = {"win32": "icon.ico", "darwin": "icon.icns"}.get(sys.platform)
@@ -132,7 +139,7 @@ a = Analysis(  # noqa: F821 - PyInstaller spec globals
     optimize=0,
 )
 a.binaries = [entry for entry in a.binaries if not _unused_qt(entry[0])]
-a.datas = [entry for entry in a.datas if not _unused_qt(entry[0])]
+a.datas = [entry for entry in a.datas if not (_unused_qt(entry[0]) or _unused_asset(entry[0]))]
 
 pyz = PYZ(a.pure)  # noqa: F821
 

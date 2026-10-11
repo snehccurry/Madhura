@@ -35,12 +35,10 @@ _IO_MS = 500
 _LOCK_WAIT_MS = 100
 #: The primary takes the lock before QApplication exists and listens only after it is built; a
 #: launch racing that startup (autostart vs. a click at login) keeps trying this long.
+#: Any connection error is retried until then: a pipe that isn't listening yet reports
+#: ServerNotFound/ConnectionRefused on Unix but can surface as other errors on Windows.
 _CONNECT_DEADLINE_MS = 2500
 _CONNECT_RETRY_MS = 100
-_NOT_LISTENING_YET = (
-    QLocalSocket.LocalSocketError.ServerNotFoundError,
-    QLocalSocket.LocalSocketError.ConnectionRefusedError,
-)
 
 
 class InstanceStatus(ValueEnum):
@@ -79,6 +77,7 @@ class SingleInstance(QObject):
         self._buffers: dict[int, bytes] = {}
         self.disabled = paths.no_single_instance()
         self.error: str | None = None
+        self._last_failure: str | None = None
 
     @property
     def server_name(self) -> str:
@@ -122,7 +121,11 @@ class SingleInstance(QObject):
         if self.signal_existing():
             return InstanceStatus.SIGNALED
         self.error = "Madhura is already running but did not respond. Close it and try again."
-        log.error("Lock held by another instance that did not answer on %s", self.server_name)
+        log.error(
+            "Lock held by another instance that did not answer on %s (%s)",
+            self.server_name,
+            self._last_failure or "no details",
+        )
         return InstanceStatus.FAILED
 
     def _connect(self) -> QLocalSocket | None:
@@ -134,10 +137,10 @@ class SingleInstance(QObject):
             sock.connectToServer(self.server_name)
             if sock.waitForConnected(_CONNECT_MS):
                 return sock
-            error = sock.error()
+            self._last_failure = f"connect: {sock.error().name}: {sock.errorString()}"
             sock.abort()
-            if error not in _NOT_LISTENING_YET or time.monotonic() >= deadline:
-                log.debug("Could not reach the running instance: %s", error)
+            if time.monotonic() >= deadline:
+                log.debug("Could not reach the running instance: %s", self._last_failure)
                 return None
             time.sleep(_CONNECT_RETRY_MS / 1000.0)
 
@@ -162,6 +165,8 @@ class SingleInstance(QObject):
             sock.write(b"show\n")
             sock.flush()
             ok = sock.waitForBytesWritten(_IO_MS) or sock.bytesToWrite() == 0
+            if not ok:
+                self._last_failure = f"write: {sock.error().name}: {sock.errorString()}"
             return bool(ok)
         finally:
             sock.disconnectFromServer()

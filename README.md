@@ -388,5 +388,6 @@ Have another idea? [Open an issue](https://github.com/snehccurry/Madhura/issues)
 
 - Madhura was created by **Abhay Gaur**. Copyright © 2026 Федор Глеб | Abhay/Abhi Gaur. Released under the [MIT License](LICENSE).
 - Notification sound: *"New Notification 041"* by **Universfield** via [Pixabay](https://pixabay.com/).
+- Typeface on Linux and macOS: [Inter](https://rsms.me/inter/) by The Inter Project Authors, bundled under the [SIL Open Font License 1.1](madhura/assets/fonts/OFL.txt). Windows uses Segoe UI.
 - Built with [Qt for Python (PySide6)](https://doc.qt.io/qtforpython-6/). The Windows build bundles Qt and PySide6, which are available under the LGPLv3.
 - The habits page is inspired by James Clear's *Atomic Habits*.
