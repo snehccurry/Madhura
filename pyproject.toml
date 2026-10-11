@@ -1,32 +1,49 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "madhura"
 version = "2.0.0"
 description = "Plan the hour. Stay with it. A calm, intentional focus companion."
-license = { text = "MIT" }
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "Abhay Gaur" }]
-keywords = ["focus", "pomodoro", "productivity", "habits", "timer"]
+keywords = ["focus", "pomodoro", "productivity", "habits", "timer", "deep work", "desktop"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Environment :: X11 Applications :: Qt",
     "Environment :: Win32 (MS Windows)",
+    "Environment :: MacOS X",
     "Intended Audience :: End Users/Desktop",
-    "License :: OSI Approved :: MIT License",
+    "Natural Language :: English",
     "Operating System :: Microsoft :: Windows",
+    "Operating System :: Microsoft :: Windows :: Windows 10",
+    "Operating System :: Microsoft :: Windows :: Windows 11",
     "Operating System :: MacOS",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Office/Business :: Scheduling",
+    "Topic :: Utilities",
 ]
 dependencies = ["PySide6-Essentials>=6.8,<6.10"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "pytest-qt>=4.2"]
+dev = ["pytest>=7", "pytest-qt>=4.2", "pyinstaller>=6.10"]
+
+[project.urls]
+Homepage = "https://github.com/snehccurry/Madhura"
+Source = "https://github.com/snehccurry/Madhura"
+Issues = "https://github.com/snehccurry/Madhura/issues"
+Releases = "https://github.com/snehccurry/Madhura/releases"
+Changelog = "https://github.com/snehccurry/Madhura/blob/main/CHANGELOG.md"
 
 [project.gui-scripts]
 madhura = "madhura.app:main"

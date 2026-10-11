@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from datetime import datetime, timedelta
 
 import pytest
@@ -161,7 +162,10 @@ def test_attention_survives_failing_sources(qapp, fake_clock, repo) -> None:
 
 def test_attention_default_sources_and_polling(qtbot, fake_clock, repo) -> None:
     m = AttentionMonitor(fake_clock, repo)
-    assert m.state() == "available"  # Linux: no idle API, system "available"
+    if sys.platform.startswith("linux"):
+        assert m.state() == "available"  # Linux: no idle API, system "available"
+    else:  # the real idle / notification-state probes describe this machine (e.g. a CI runner)
+        assert m.state() in ("available", "busy", "away")
     assert m._timer.isActive() and m._timer.interval() == 15_000
     m.stop()
     assert not m._timer.isActive()

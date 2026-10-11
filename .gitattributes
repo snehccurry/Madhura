@@ -1,0 +1,19 @@
+# Normalise line endings in the repository; code, config and CI files stay LF on every checkout.
+* text=auto
+*.py text eol=lf
+*.spec text eol=lf
+*.toml text eol=lf
+*.txt text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.md text
+
+# Binary assets: never converted or diffed as text.
+*.png binary
+*.ico binary
+*.icns binary
+*.wav binary
+*.mp3 binary
+*.db binary
+*.zip binary

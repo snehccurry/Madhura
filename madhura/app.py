@@ -10,6 +10,10 @@ Startup order: AUMID → platform env (Wayland → "xcb;wayland") → single ins
 (Fusion, no quit on last window, icon) → fonts → staged restore → DB/settings/theme →
 context → main window → tray → services → engine.restore() → show (or tray-only) →
 onboarding → pending session-complete sheet.
+
+``--self-test [REPORT]`` (hidden) skips all of that and runs :mod:`madhura.selftest`: a headless
+build of the whole app on a throwaway data folder that exits 0 when everything works (CI runs it
+on the frozen build).
 """
 
 from __future__ import annotations
@@ -30,7 +34,7 @@ from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 from madhura import APP_ID, APP_NAME, __version__, paths
 from madhura.context import AppContext, AppEvents
 from madhura.core.clock import Clock, SystemClock
-from madhura.platform import IS_LINUX
+from madhura.platform import IS_LINUX, IS_WINDOWS
 from madhura.platform import windows as win_platform
 
 if TYPE_CHECKING:
@@ -67,6 +71,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--autostart", action="store_true", help="launched at login: start in the tray")
     parser.add_argument("--minimized", action="store_true", help="start hidden in the tray (or minimized)")
     parser.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
+    # Hidden: headless completeness check of this install / frozen build (see madhura.selftest).
+    parser.add_argument("--self-test", nargs="?", const="", default=None, metavar="REPORT", help=argparse.SUPPRESS)
     args, _unknown = parser.parse_known_args(list(argv))
     return args
 
@@ -96,14 +102,21 @@ def _prepare_platform_env() -> None:
         os.environ["QT_QPA_PLATFORM"] = XWAYLAND_QPA
 
 
+#: Bundled app icon files (``tools/make_assets.py``), preferred first: the multi-size .ico on
+#: Windows, the 512 px .png elsewhere. Both are loaded, so the .ico's natively drawn 16–256 px
+#: frames keep the title bar / taskbar / Alt+Tab icon crisp on every OS.
+APP_ICON_FILES: tuple[str, ...] = ("icon.ico", "icon.png") if IS_WINDOWS else ("icon.png", "icon.ico")
+
+
 def _app_icon() -> QIcon:
-    """Bundled icon.png/ico when present, else the programmatic tray ring."""
-    for name in ("icon.ico", "icon.png"):
+    """The application / window icon from :data:`APP_ICON_FILES`, else the programmatic tray ring."""
+    icon = QIcon()
+    for name in APP_ICON_FILES:
         path = paths.asset(name)
         if path.is_file():
-            icon = QIcon(str(path))
-            if not icon.isNull():
-                return icon
+            icon.addFile(str(path))
+    if not icon.isNull() and icon.availableSizes():
+        return icon
     from madhura.ui.tray import tray_icon_for
 
     return tray_icon_for("idle", 1.0)
@@ -500,6 +513,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not argv_list:
         argv_list = [APP_NAME.lower()]
     args = parse_args(argv_list[1:])
+    if args.self_test is not None:
+        from madhura import selftest
+
+        return selftest.run(args.self_test or None, argv_list)
 
     win_platform.set_app_user_model_id(APP_ID)
     _prepare_platform_env()

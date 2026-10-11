@@ -5,17 +5,20 @@ weekday morning (Wednesday 14 Oct 2026, 10:50), builds the real app (``create_co
 ``create_main_window`` → ``start_services``) on Qt's offscreen platform and saves a PNG of every
 page, sheet, floating panel and state, in dark and light::
 
-    python tools/screenshots.py                          # dark + light → docs/screenshots/
+    python tools/screenshots.py --readme                 # the README's images → docs/screenshots/
+    python tools/screenshots.py                          # all of them, dark + light → build/screenshots/
     python tools/screenshots.py --theme light --out /tmp/shots
     python tools/screenshots.py --scale 2                # HiDPI renders (2× pixels)
     python tools/screenshots.py --only hero,focus_idle   # just these (names: --list)
-    python tools/screenshots.py --list
+    python tools/screenshots.py --list                   # shot names (with --readme: the README set)
 
-Files are named ``<shot>_<theme>.png``. The main window is 1280×800 logical pixels; floating
-panels (pill, check-in, nudge, …) are composited on a neutral desktop-like backdrop, and
-``hero_<theme>.png`` shows the main window, the mini timer and a check-in together for the
-README. Output is deterministic: fixed clock and seed, reduce-motion on, 24-hour time, no text
-cursor blink, background timers frozen. Runs headless; nothing outside the temp dir is touched
+Files are named ``<shot>_<theme>.png``; ``--readme`` writes the curated set in
+:data:`README_SHOTS` under stable descriptive names instead (``hero-dark.png``, …) at 2× so they
+stay sharp on HiDPI screens. The main window is 1280×800 logical pixels; floating panels (pill,
+check-in, nudge, …) are composited on a neutral desktop-like backdrop, and ``hero_<theme>.png``
+shows the main window, the mini timer and a check-in together for the README. Output is
+deterministic: fixed clock and seed, reduce-motion on, 24-hour time, no text cursor blink,
+background timers frozen. Runs headless; nothing outside the temp dir is touched
 (launch-at-login and the old-habits scan are redirected/disabled).
 """
 
@@ -33,7 +36,11 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_OUT = REPO_ROOT / "docs" / "screenshots"
+#: The full set (72 files) is for review, not for the repository; ``build/`` is git-ignored.
+DEFAULT_OUT = REPO_ROOT / "build" / "screenshots"
+#: Where ``--readme`` writes the curated set the README and docs link to.
+README_OUT = REPO_ROOT / "docs" / "screenshots"
+README_SCALE = 2.0
 
 #: Wednesday morning, inside the default work hours.
 NOW = datetime(2026, 10, 14, 10, 50)
@@ -70,6 +77,7 @@ SHOTS: tuple[str, ...] = (
     "pill_expanded",
     "pill_states",
     "checkin_popup",
+    "checkin_pill",
     "checkin_popup_reasons",
     "away_panel",
     "hero",
@@ -85,6 +93,26 @@ SHOTS: tuple[str, ...] = (
     "focus_empty",
     "habits_empty",
     "insights_empty",
+)
+
+#: The README's images (``--readme``): (shot, theme, file name in docs/screenshots/).
+README_SHOTS: tuple[tuple[str, str, str], ...] = (
+    ("hero", "dark", "hero-dark.png"),
+    ("focus_idle", "dark", "focus-planning-dark.png"),
+    ("focus_idle", "light", "focus-planning-light.png"),
+    ("focus_active", "dark", "focus-active-dark.png"),
+    ("checkin_pill", "dark", "checkin-popup-pill-dark.png"),
+    ("checkin_popup_reasons", "dark", "checkin-reasons-dark.png"),
+    ("pill_states", "dark", "pill-states-dark.png"),
+    ("session_complete", "dark", "session-complete-dark.png"),
+    ("nudge_popup", "dark", "nudge-dark.png"),
+    ("habits", "dark", "habits-dark.png"),
+    ("habit_reminder", "dark", "habit-reminder-dark.png"),
+    ("insights_30d", "dark", "insights-30d-dark.png"),
+    ("insights_30d", "light", "insights-30d-light.png"),
+    ("wrap_up", "dark", "wrap-up-dark.png"),
+    ("settings_top", "dark", "settings-dark.png"),
+    ("onboarding_1", "dark", "onboarding-welcome-dark.png"),
 )
 
 
@@ -146,12 +174,22 @@ def _load_seed_demo() -> Any:
 class Shooter:
     """Drives one app context at a time and writes the PNGs."""
 
-    def __init__(self, app: Any, out: Path, scale: float, only: set[str] | None, root: Path) -> None:
+    def __init__(
+        self,
+        app: Any,
+        out: Path,
+        scale: float,
+        only: set[str] | None,
+        root: Path,
+        names: dict[tuple[str, str], str] | None = None,
+    ) -> None:
         self.app = app
         self.out = out
         self.scale = scale
         self.only = only
         self.root = root
+        #: (shot, theme) → file name; when set, only these are written (the ``--readme`` set).
+        self.names = names
         self.theme = "dark"
         self.ctx: Any = None
         self.clock: Any = None
@@ -168,9 +206,13 @@ class Shooter:
         QTest.qWait(ms)
 
     def wanted(self, name: str) -> bool:
+        if self.names is not None:
+            return (name, self.theme) in self.names
         return self.only is None or name in self.only
 
     def path(self, name: str) -> Path:
+        if self.names is not None:
+            return self.out / self.names[(name, self.theme)]
         return self.out / f"{name}_{self.theme}.png"
 
     def save(self, pixmap: Any, name: str) -> None:
@@ -301,6 +343,54 @@ class Shooter:
         for g in grabs:
             p.drawPixmap(pad, y, g)
             y += round(g.height() / g.devicePixelRatio()) + gap
+        p.end()
+        self.save(canvas, name)
+
+    def compose_rows(self, rows: Sequence[Sequence[Any]], name: str, *, pad: int = 28, gap: int = 12) -> None:
+        """Grabs of floating panels in rows (each row centred) on the backdrop."""
+        from PySide6.QtCore import QRect
+        from PySide6.QtGui import QPainter
+
+        if not self.wanted(name):
+            return
+
+        def size(g: Any) -> tuple[int, int]:
+            return round(g.width() / g.devicePixelRatio()), round(g.height() / g.devicePixelRatio())
+
+        row_widths = [sum(size(g)[0] for g in row) + gap * (len(row) - 1) for row in rows]
+        row_heights = [max(size(g)[1] for g in row) for row in rows]
+        width = max(row_widths) + 2 * pad
+        height = sum(row_heights) + gap * (len(rows) - 1) + 2 * pad
+        canvas = self.backdrop(width, height)
+        p = QPainter(canvas)
+        y = pad
+        for row, row_w, row_h in zip(rows, row_widths, row_heights, strict=True):
+            x = (width - row_w) // 2
+            for g in row:
+                w, h = size(g)
+                p.drawPixmap(QRect(x, y + (row_h - h) // 2, w, h), g)
+                x += w + gap
+            y += row_h + gap
+        p.end()
+        self.save(canvas, name)
+
+    def compose_corner(self, widgets: Sequence[Any], name: str, *, pad: int = 20) -> None:
+        """Floating windows at their real on-screen placement (the check-in panel stacked above
+        the mini timer), cropped to the corner of the desktop they occupy."""
+        from PySide6.QtCore import QRect
+        from PySide6.QtGui import QPainter
+
+        if not self.wanted(name):
+            return
+        self.pump(4)
+        area = QRect()
+        for widget in widgets:
+            area = area.united(widget.geometry())
+        area.adjust(-pad, -pad, pad, pad)
+        canvas = self.backdrop(area.width(), area.height())
+        p = QPainter(canvas)
+        for widget in widgets:
+            p.drawPixmap(widget.geometry().topLeft() - area.topLeft(), widget.grab())
         p.end()
         self.save(canvas, name)
 
@@ -463,6 +553,9 @@ class Shooter:
 
         self.show_page("settings")
         settings = window.page("settings")
+        # Show the default "Hide to mini timer" (the renderer itself runs with "Stay open").
+        self.ctx.settings.update(after_start="mini")
+        self.pump(4)
         settings.verticalScrollBar().setValue(0)
         self.grab_window("settings_top")
         for title, name in (("Sound", "settings_sound"), ("Appearance", "settings_appearance"), ("Data", "settings_data")):
@@ -472,6 +565,8 @@ class Shooter:
             self.pump(4)
             self.grab_window(name)
         settings.verticalScrollBar().setValue(0)
+        self.ctx.settings.update(after_start="stay")
+        self.pump(4)
 
         window.show_shortcuts()
         self.pump(8)
@@ -483,6 +578,7 @@ class Shooter:
 
         self.show_page("focus")
         sheet = open_wrap_up(self.ctx)
+        assert sheet is not None, "the wrap-up sheet did not open"
         self.pump(8)
         sheet.went_well.set_text("Two deep blocks before lunch")
         sheet.first_block.set_text("Write the release announcement")
@@ -550,6 +646,7 @@ class Shooter:
         assert popup is not None and ctx.checkins.prompt_mode == "popup"
         self.pump(6)
         self.compose_panels([popup], "checkin_popup")
+        self.compose_corner([popup, pill], "checkin_pill")
         self.compose_hero(hero_window, [popup, pill])
         popup.answer_back()
         self.pump(8)
@@ -589,6 +686,8 @@ class Shooter:
         sheet = window.sheet_host.current()
         assert sheet is not None, "no pending summary sheet"
         sheet.note.set_text("Slides are done — the demo flow needs one more pass.")
+        # Leave the caret where a user who just typed the note would have it.
+        sheet.note.moveCursor(sheet.note.textCursor().MoveOperation.End)
         self.pump(6)
         self.grab_window("session_complete")
         sheet.main_button.click()  # Take a 5-min break
@@ -629,41 +728,33 @@ class Shooter:
         self.pump(2)
 
     def pill_states(self) -> None:
-        """Paused, break and done pills side by side (collapsed and expanded)."""
+        """The mini timer: expanded on hover (top row); running, paused, break and done (below)."""
         if not self.wanted("pill_states"):
             return
-        from PySide6.QtCore import QRect
-        from PySide6.QtGui import QPainter
-
         ctx = self.ctx
         pill = ctx.pill.pill
-        snapshots: list[Any] = []
+        pill.set_expanded(True, animate=False)
+        self.pump(4)
+        expanded = pill.grab()
+        pill.set_expanded(False, animate=False)
+        self.pump(4)
+        states: list[Any] = [pill.grab()]
         ctx.engine.pause()
         ctx.pill.refresh()
         self.pump(4)
-        snapshots.append(pill.grab())
+        states.append(pill.grab())
         ctx.engine.resume()
         task = pill.task_text()
-        for mode, collapsed, expanded, label in (
+        for mode, collapsed, expanded_text, label in (
             ("break", "4m", "4:12", "Lunch"),
             ("done", "Done", "Done", task),
         ):
-            pill.set_display(mode, collapsed=collapsed, expanded=expanded, task=label, fraction=0.7)
+            pill.set_display(mode, collapsed=collapsed, expanded=expanded_text, task=label, fraction=0.7)
             self.pump(4)
-            snapshots.append(pill.grab())
+            states.append(pill.grab())
         ctx.pill.refresh()
         self.pump(4)
-        pad, gap = 28, 12
-        widths = [round(s.width() / s.devicePixelRatio()) for s in snapshots]
-        height = max(round(s.height() / s.devicePixelRatio()) for s in snapshots)
-        canvas = self.backdrop(sum(widths) + gap * (len(widths) - 1) + 2 * pad, height + 2 * pad)
-        p = QPainter(canvas)
-        x = pad
-        for s, w in zip(snapshots, widths, strict=True):
-            p.drawPixmap(QRect(x, pad, w, round(s.height() / s.devicePixelRatio())), s)
-            x += w + gap
-        p.end()
-        self.save(canvas, "pill_states")
+        self.compose_rows([[expanded], states], "pill_states")
 
     # ------------------------------------------------------------------ first run + empty states
     def first_run_screens(self) -> None:
@@ -693,13 +784,32 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         description="Render deterministic Madhura screenshots (every screen and state, dark and light).",
     )
     default_out = DEFAULT_OUT.relative_to(REPO_ROOT)
-    parser.add_argument("--out", type=Path, default=DEFAULT_OUT, help=f"output directory (default: {default_out})")
-    parser.add_argument("--theme", choices=("dark", "light", "both"), default="both", help="theme(s) to render (default: both)")
-    parser.add_argument("--scale", type=float, default=1.0, help="device pixel ratio of the renders, e.g. 1.5 or 2 (default: 1)")
+    readme_out = README_OUT.relative_to(REPO_ROOT)
+    parser.add_argument(
+        "--readme",
+        action="store_true",
+        help=f"write just the README's images, under descriptive names, to {readme_out} at {README_SCALE:g}x",
+    )
+    parser.add_argument("--out", type=Path, default=None, help=f"output directory (default: {default_out}; --readme: {readme_out})")
+    parser.add_argument("--theme", choices=("dark", "light", "both"), default=None, help="theme(s) to render (default: both)")
+    parser.add_argument(
+        "--scale",
+        type=float,
+        default=None,
+        help=f"device pixel ratio of the renders, e.g. 1.5 or 2 (default: 1; --readme: {README_SCALE:g})",
+    )
     parser.add_argument("--only", default=None, help="comma-separated shot names to write (default: all; see --list)")
-    parser.add_argument("--list", action="store_true", help="print the shot names and exit")
+    parser.add_argument("--list", action="store_true", help="print the shot names (with --readme: the README set) and exit")
     parser.add_argument("--keep-temp", action="store_true", help="keep the temporary data directories (debugging)")
     args = parser.parse_args(list(argv))
+    if args.readme and (args.only or args.theme):
+        parser.error("--readme renders a fixed set; it can't be combined with --only or --theme")
+    if args.scale is None:
+        args.scale = README_SCALE if args.readme else 1.0
+    if args.out is None:
+        args.out = README_OUT if args.readme else DEFAULT_OUT
+    if args.theme is None:
+        args.theme = "both"
     if not 0.5 <= args.scale <= 4:
         parser.error("--scale must be between 0.5 and 4")
     if args.only:
@@ -714,8 +824,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     if args.list:
-        print("\n".join(SHOTS))
+        if args.readme:
+            print("\n".join(f"{file}  ({shot}, {theme})" for shot, theme, file in README_SHOTS))
+        else:
+            print("\n".join(SHOTS))
         return 0
+    names = {(shot, theme): file for shot, theme, file in README_SHOTS} if args.readme else None
     # A fixed scratch path keeps the renders byte-for-byte reproducible.
     root = Path(tempfile.gettempdir()) / "madhura-screenshots"
     shutil.rmtree(root, ignore_errors=True)
@@ -748,13 +862,25 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         out = args.out.expanduser().resolve()
         out.mkdir(parents=True, exist_ok=True)
-        shooter = Shooter(app, out, args.scale, args.only, root)
-        themes = THEMES if args.theme == "both" else (args.theme,)
+        shooter = Shooter(app, out, args.scale, args.only, root, names)
+        if names is not None:
+            themes = tuple(t for t in THEMES if any(theme == t for _shot, theme in names))
+        else:
+            themes = THEMES if args.theme == "both" else (args.theme,)
         for theme_name in themes:
             shooter.run_theme(theme_name, template)
         for path in shooter.written:
             print(path)
-        print(f"{len(shooter.written)} screenshots in {out}")
+        size_mb = sum(p.stat().st_size for p in shooter.written) / 1e6
+        print(f"{len(shooter.written)} screenshots ({size_mb:.1f} MB) in {out}")
+        if names is not None:
+            missing = sorted(set(names.values()) - {p.name for p in shooter.written})
+            if missing:
+                print(f"not rendered: {', '.join(missing)}", file=sys.stderr)
+                return 1
+            stale = sorted(p.name for p in out.glob("*.png") if p.name not in set(names.values()))
+            if stale:
+                print(f"not part of the README set (delete if unused): {', '.join(stale)}", file=sys.stderr)
         return 0
     finally:
         if args.keep_temp:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -121,7 +122,8 @@ def test_stage_restore_includes_uncheckpointed_wal(tmp_path: Path) -> None:
     """A source whose commits still sit in its -wal (copied from a running/crashed app, or a
     quarantined file) restores with those commits, as one standalone file. The folder name
     has URI-special characters, which must not break the read-only file: URI."""
-    folder = tmp_path / "copy #2 ?100%"
+    # "?" can't be part of a Windows file name; "#" and "%" still need escaping there.
+    folder = tmp_path / ("copy #2 100%" if sys.platform == "win32" else "copy #2 ?100%")
     folder.mkdir()
     source = folder / "madhura.db"
     src = Repository(source)
