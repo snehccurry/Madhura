@@ -21,6 +21,18 @@ BREATH_FRAME_MS = 66
 _BREATH_STEP = 0.01  # smaller opacity changes are not worth a repaint
 
 
+def _grayscale_aa(f: QFont) -> QFont:
+    """Copy of ``f`` that never uses subpixel (ClearType/LCD) antialiasing.
+
+    While breathing, the face is painted from a cached transparent layer, where Qt can only
+    antialias text in grayscale; painting the live text the same way keeps the digits from
+    changing look when the ring starts or stops breathing.
+    """
+    out = QFont(f)
+    out.setStyleStrategy(out.styleStrategy() | QFont.StyleStrategy.NoSubpixelAntialias)
+    return out
+
+
 class ProgressRing(QWidget):
     """Circular progress arc starting at 12 o'clock and running clockwise.
 
@@ -44,10 +56,10 @@ class ProgressRing(QWidget):
         self._text = ""
         self._caption = ""
         self._opacity = 1.0
-        self._center_font: QFont = (
+        self._center_font: QFont = _grayscale_aa(
             fonts.display_font(60, 300) if diameter >= 240 else fonts.display_font(max(10, diameter * 0.22), 400)
         )
-        self._caption_font: QFont = fonts.font(13 if diameter >= 160 else 11, 500)
+        self._caption_font: QFont = _grayscale_aa(fonts.font(13 if diameter >= 160 else 11, 500))
         self._anim = QVariantAnimation(self)
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._anim.valueChanged.connect(self._on_anim)
@@ -144,12 +156,12 @@ class ProgressRing(QWidget):
 
     def set_center_font(self, f: QFont) -> None:
         """Font for the centre text (use :func:`fonts.display_font`)."""
-        self._center_font = QFont(f)
+        self._center_font = _grayscale_aa(f)
         self.update()
 
     def set_caption_font(self, f: QFont) -> None:
         """Font for the caption."""
-        self._caption_font = QFont(f)
+        self._caption_font = _grayscale_aa(f)
         self.update()
 
     def set_thickness(self, thickness: float) -> None:

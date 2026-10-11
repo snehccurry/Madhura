@@ -58,17 +58,29 @@ def test_exit_codes() -> None:
     assert InstanceStatus.FAILED == "failed"
 
 
-def _second_instance(data_dir: Path) -> subprocess.Popen[str]:
-    code = textwrap.dedent(
-        """
-        import os, sys
-        os.environ.pop("MADHURA_NO_SINGLE_INSTANCE", None)
-        from madhura.services.single_instance import SingleInstance
-        guard = SingleInstance()
-        status = guard.acquire()
-        print(status.value)
-        sys.exit(guard.exit_code(status))
-        """
+def _second_instance(data_dir: Path, prelude: str = "") -> subprocess.Popen[str]:
+    """Launch a real second process (``prelude`` runs first, e.g. to inject socket faults).
+
+    The handshake has to cross processes: on Windows a named-pipe client and server living on one
+    thread cannot complete a write, so in-process "second launches" fail there for no real reason.
+    """
+    code = (
+        textwrap.dedent(
+            """
+            import os, sys
+            os.environ.pop("MADHURA_NO_SINGLE_INSTANCE", None)
+            """
+        )
+        + textwrap.dedent(prelude)
+        + textwrap.dedent(
+            """
+            from madhura.services.single_instance import SingleInstance
+            guard = SingleInstance()
+            status = guard.acquire()
+            print(status.value)
+            sys.exit(guard.exit_code(status))
+            """
+        )
     )
     env = {**os.environ, "MADHURA_DATA_DIR": str(data_dir), "PYTHONPATH": str(REPO_ROOT)}
     env.pop("MADHURA_NO_SINGLE_INSTANCE", None)
@@ -106,10 +118,10 @@ def test_lock_held_but_no_server_fails(qapp, enabled, data_dir: Path) -> None:
         holder.release()
 
 
-def test_second_launch_waits_for_a_starting_primary(qtbot, enabled, data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_second_launch_waits_for_a_starting_primary(qtbot, enabled, data_dir: Path) -> None:
     """The primary holds the lock but is not listening yet (still building QApplication): a racing
     launch must keep trying instead of reporting "did not respond"."""
-    from madhura.services import single_instance as si
+    from PySide6.QtCore import QTimer
 
     holder = SingleInstance()
     shows: list[bool] = []
@@ -119,48 +131,47 @@ def test_second_launch_waits_for_a_starting_primary(qtbot, enabled, data_dir: Pa
         holder._server.close()
         holder._server.deleteLater()
         holder._server = None  # lock taken, not listening yet
-        waits: list[float] = []
-
-        def primary_comes_up(seconds: float) -> None:
-            waits.append(seconds)
-            if len(waits) == 2:
-                assert holder.listen()
-
-        monkeypatch.setattr(si.time, "sleep", primary_comes_up)
-        second = SingleInstance()
-        assert second.acquire() is InstanceStatus.SIGNALED
-        assert len(waits) == 2
-        qtbot.waitUntil(lambda: shows == [True], timeout=5_000)
+        proc = _second_instance(data_dir)
+        QTimer.singleShot(700, holder.listen)  # the primary finishes starting while the launch retries
+        qtbot.waitUntil(lambda: proc.poll() is not None and bool(shows), timeout=15_000)
+        out, err = proc.communicate(timeout=5)
+        assert proc.returncode == 0, err
+        assert out.strip() == "signaled"
+        assert shows == [True]
     finally:
         holder.release()
 
 
-def test_second_launch_retries_any_connect_error(qtbot, enabled, data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_second_launch_retries_any_connect_error(qtbot, enabled, data_dir: Path) -> None:
     """A starting primary's pipe can fail with errors other than ServerNotFound on Windows; the
     racing launch must keep retrying until the deadline rather than report "did not respond"."""
-    from madhura.services import single_instance as si
-
     holder = SingleInstance()
     shows: list[bool] = []
     holder.show_requested.connect(lambda: shows.append(True))
-    real = si.QLocalSocket
-    attempts: list[int] = []
+    flaky = """
+        import madhura.services.single_instance as si
+        real = si.QLocalSocket
+        attempts = []
 
-    class Flaky(real):  # type: ignore[misc, valid-type]
-        def waitForConnected(self, msecs: int = 30_000) -> bool:  # noqa: N802 - Qt override
-            attempts.append(1)
-            return False if len(attempts) <= 2 else super().waitForConnected(msecs)
+        class Flaky(real):
+            def waitForConnected(self, msecs=30_000):
+                attempts.append(1)
+                return False if len(attempts) <= 2 else super().waitForConnected(msecs)
 
-        def error(self):  # type: ignore[no-untyped-def]
-            return real.LocalSocketError.UnknownSocketError if len(attempts) <= 2 else super().error()
+            def error(self):
+                return real.LocalSocketError.UnknownSocketError if len(attempts) <= 2 else super().error()
 
+        si.QLocalSocket = Flaky
+        import atexit
+        atexit.register(lambda: print(f"attempts={len(attempts)}"))
+        """
     try:
         assert holder.acquire() is InstanceStatus.PRIMARY
-        monkeypatch.setattr(si, "QLocalSocket", Flaky)
-        monkeypatch.setattr(si.time, "sleep", lambda _s: None)
-        second = SingleInstance()
-        assert second.acquire() is InstanceStatus.SIGNALED
-        assert len(attempts) == 3
-        qtbot.waitUntil(lambda: shows == [True], timeout=5_000)
+        proc = _second_instance(data_dir, prelude=flaky)
+        qtbot.waitUntil(lambda: proc.poll() is not None and bool(shows), timeout=15_000)
+        out, err = proc.communicate(timeout=5)
+        assert proc.returncode == 0, err
+        assert out.split() == ["signaled", "attempts=3"]
+        assert shows == [True]
     finally:
         holder.release()
