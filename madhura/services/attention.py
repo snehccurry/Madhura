@@ -18,6 +18,7 @@ from PySide6.QtCore import QObject, QTimer, Signal
 
 from madhura.core.clock import Clock
 from madhura.core.models import from_iso, to_iso
+from madhura.log import warn_once
 from madhura.platform import attention as platform_attention
 from madhura.platform import idle as platform_idle
 
@@ -56,6 +57,7 @@ class AttentionMonitor(QObject):
         self._repo = repo
         self._system_fn = system_attention_fn or platform_attention.system_attention
         self._idle_fn = idle_fn or platform_idle.get_idle_seconds
+        self._warned: set[str] = set()
         self._quiet_until: datetime | None = self._load_quiet()
         self._state = AVAILABLE
         self._timer = QTimer(self)
@@ -105,15 +107,15 @@ class AttentionMonitor(QObject):
         try:
             return self._idle_fn()
         except Exception:  # noqa: BLE001 - platform probing must never raise
-            log.debug("idle_fn failed", exc_info=True)
+            warn_once(log, self._warned, "idle", "Input idle probe failed")
             return None
 
     def system_state(self) -> str:
         """Raw OS attention ("available" | "busy" | "away")."""
         try:
             return self._system_fn()
-        except Exception:  # noqa: BLE001
-            log.debug("system_attention_fn failed", exc_info=True)
+        except Exception:  # noqa: BLE001 - platform probing must never raise
+            warn_once(log, self._warned, "system", "System attention probe failed")
             return AVAILABLE
 
     # ------------------------------------------------------------------ state

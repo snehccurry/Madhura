@@ -2,12 +2,99 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
+from madhura import __version__, paths
 from madhura.platform import autostart
+
+
+def _split_windows(cmd: str) -> list[str]:
+    """Split a command line the way the MSVC runtime builds argv (what pythonw.exe will see)."""
+    assert cmd.startswith('"')
+    end = cmd.index('"', 1)
+    args, rest = [cmd[1:end]], cmd[end + 1 :]
+    i, cur, in_arg, quoted = 0, "", False, False
+    while i < len(rest):
+        ch = rest[i]
+        if ch == "\\":
+            n = len(rest[i:]) - len(rest[i:].lstrip("\\"))
+            i += n
+            if i < len(rest) and rest[i] == '"':
+                cur += "\\" * (n // 2)
+                if n % 2:
+                    cur += '"'
+                    i += 1
+            else:
+                cur += "\\" * n
+            in_arg = True
+            continue
+        if ch == '"':
+            quoted, in_arg = not quoted, True
+        elif ch in " \t" and not quoted:
+            if in_arg:
+                args.append(cur)
+            cur, in_arg = "", False
+        else:
+            cur, in_arg = cur + ch, True
+        i += 1
+    if in_arg:
+        args.append(cur)
+    return args
+
+
+class _Key:
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def __enter__(self) -> _Key:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def _fake_winreg(store: dict[str, dict[str, Any]]) -> SimpleNamespace:
+    """Just enough of ``winreg`` (HKCU only) for the Run / StartupApproved keys."""
+
+    def open_key(_root: int, path: str, _reserved: int = 0, _access: int = 0) -> _Key:
+        if path not in store:
+            raise FileNotFoundError(path)
+        return _Key(path)
+
+    def create_key(_root: int, path: str, _reserved: int = 0, _access: int = 0) -> _Key:
+        store.setdefault(path, {})
+        return _Key(path)
+
+    def query(key: _Key, name: str) -> tuple[Any, int]:
+        if name not in store[key.path]:
+            raise FileNotFoundError(name)
+        return store[key.path][name], 1
+
+    def set_value(key: _Key, name: str, _reserved: int, _kind: int, value: Any) -> None:
+        store[key.path][name] = value
+
+    def delete_value(key: _Key, name: str) -> None:
+        if store[key.path].pop(name, None) is None:
+            raise FileNotFoundError(name)
+
+    return SimpleNamespace(
+        HKEY_CURRENT_USER=1,
+        KEY_READ=0x20019,
+        KEY_SET_VALUE=0x0002,
+        REG_SZ=1,
+        OpenKey=open_key,
+        CreateKeyEx=create_key,
+        QueryValueEx=query,
+        SetValueEx=set_value,
+        DeleteValue=delete_value,
+    )
 
 
 @pytest.fixture
@@ -35,6 +122,77 @@ def test_windows_command_from_source_uses_pythonw_next_to_python() -> None:
         autostart.windows_command(exe, False, use_pythonw=False)
         == '"C:\\Users\\Ann\\venv\\Scripts\\python.exe" -m madhura --autostart'
     )
+
+
+@pytest.mark.parametrize(
+    "root",
+    [r"C:\Users\Ann\src\Madhura", r"C:\Users\O'Brien\My Code\Madhura", "D:\\", r"\\server\share\Madhura"],
+)
+def test_windows_command_from_checkout_passes_the_folder_as_an_argument(root: str) -> None:
+    exe = r"C:\Users\Ann\venv\Scripts\python.exe"
+    cmd = autostart.windows_command(exe, False, source_root=root)
+    pythonw = r"C:\Users\Ann\venv\Scripts\pythonw.exe"
+    # The folder is its own argument (a quote or space in it can't break the Python source), and a
+    # trailing backslash (a drive root) doesn't swallow the closing quote.
+    assert _split_windows(cmd) == [pythonw, "-c", autostart.SOURCE_BOOTSTRAP, root, "--autostart"]
+    assert '"' not in autostart.SOURCE_BOOTSTRAP and "\\" not in autostart.SOURCE_BOOTSTRAP
+    assert _split_windows(autostart.windows_command(exe, False)) == [pythonw, "-m", "madhura", "--autostart"]
+
+
+def test_windows_checkout_command_stays_short() -> None:
+    # Windows documents Run-key command lines as at most 260 characters.
+    exe = r"C:\Users\Annabelle\AppData\Local\Programs\Python\Python313\python.exe"
+    cmd = autostart.windows_command(exe, False, source_root=r"C:\Users\Annabelle\Documents\GitHub\Madhura")
+    assert len(cmd) <= 240
+
+
+def test_windows_source_checkout_registers_a_command_that_finds_the_checkout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run-key entries start in System32, so ``-m madhura`` alone can't find a checkout."""
+    store: dict[str, dict[str, Any]] = {}
+    monkeypatch.setitem(sys.modules, "winreg", _fake_winreg(store))
+    monkeypatch.setattr(autostart, "_IS_WINDOWS", True)
+    monkeypatch.setattr(autostart, "_IS_LINUX", False)
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    exe = r"C:\Users\Ann\venv\Scripts\python.exe"  # no pythonw.exe on this disk → python.exe
+    root = r"C:\Users\Ann\src\Madhura"
+    monkeypatch.setattr(sys, "executable", exe)
+    monkeypatch.setattr(autostart, "_source_root", lambda: root)
+
+    # An entry from an earlier version (plain "-m madhura") never started: offer Repair.
+    store[autostart.RUN_KEY] = {"Madhura": f'"{exe}" -m madhura --autostart'}
+    assert autostart.status() == "needs_repair"
+    assert autostart.set_enabled(True) is True
+    value = store[autostart.RUN_KEY]["Madhura"]
+    assert _split_windows(value) == [exe, "-c", autostart.SOURCE_BOOTSTRAP, root, "--autostart"]
+    assert autostart.status() == "on"
+    assert autostart.launch_command() == [exe, "-c", autostart.SOURCE_BOOTSTRAP, root, "--autostart"]
+
+    # Installed into site-packages: the plain form works from any folder and is what we expect.
+    monkeypatch.setattr(autostart, "_source_root", lambda: None)
+    assert autostart.status() == "needs_repair"
+    assert autostart.set_enabled(True) is True
+    assert store[autostart.RUN_KEY]["Madhura"] == f'"{exe}" -m madhura --autostart'
+    assert autostart.status() == "on"
+    assert autostart.set_enabled(False) is True
+    assert "Madhura" not in store[autostart.RUN_KEY] and autostart.status() == "off"
+
+
+def test_source_root_is_the_checkout_unless_installed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import site
+
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.setattr(site, "ENABLE_USER_SITE", False)
+    monkeypatch.setattr(site, "getsitepackages", lambda: [str(tmp_path)])
+    assert autostart._source_root() == str(paths.repo_root())  # noqa: SLF001
+    monkeypatch.setattr(site, "getsitepackages", lambda: [str(tmp_path), str(paths.repo_root())])
+    assert autostart._source_root() is None  # noqa: SLF001
+    monkeypatch.setattr(site, "getsitepackages", lambda: [])
+    monkeypatch.setattr(site, "ENABLE_USER_SITE", True)
+    monkeypatch.setattr(site, "getusersitepackages", lambda: str(paths.repo_root()))
+    assert autostart._source_root() is None  # noqa: SLF001
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(site, "getsitepackages", lambda: [str(tmp_path)])
+    assert autostart._source_root() is None  # noqa: SLF001
 
 
 @pytest.mark.parametrize(
@@ -87,9 +245,40 @@ def test_launch_command_from_source_and_frozen(monkeypatch: pytest.MonkeyPatch) 
 def test_relaunch_command_drops_background_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delattr(sys, "frozen", raising=False)
     argv = ["/x/madhura/__main__.py", "--autostart", "--minimized", "-platform", "xcb"]
+    monkeypatch.setattr(autostart, "_source_root", lambda: None)
     assert autostart.relaunch_command(argv) == [sys.executable, "-m", "madhura", "-platform", "xcb"]
+    monkeypatch.setattr(autostart, "_source_root", lambda: "/src/Madhura")
+    assert autostart.relaunch_command(argv) == [
+        sys.executable, "-c", autostart.SOURCE_BOOTSTRAP, "/src/Madhura", "-platform", "xcb",
+    ]  # fmt: skip
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     assert autostart.relaunch_command(["Madhura.exe", "--minimized"]) == [sys.executable]
+
+
+def test_relaunch_command_starts_madhura_from_any_folder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Started at login on Windows the current folder is System32; the relaunch must still work."""
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    cmd = autostart.relaunch_command(["madhura", "--autostart", "--version"])
+    done = subprocess.run(cmd, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120, check=False)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == f"Madhura {__version__}"
+
+
+def test_prepare_relaunch_environment_starts_a_frozen_build_fresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    pyi = {
+        "_PYI_APPLICATION_HOME_DIR": "/tmp/_MEIabc",
+        "_PYI_PARENT_PROCESS_LEVEL": "1",
+        "_PYI_ARCHIVE_FILE": "/opt/Madhura",
+        "_MEIPASS2": "/tmp/_MEIabc",  # PyInstaller < 6.10
+    }
+    env = {"PATH": "/usr/bin", "HOME": "/home/ann", **pyi}
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    autostart.prepare_relaunch_environment(env)
+    assert env == {"PATH": "/usr/bin", "HOME": "/home/ann", **pyi}  # from source: untouched
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    autostart.prepare_relaunch_environment(env)
+    assert env == {"PATH": "/usr/bin", "HOME": "/home/ann", "PYINSTALLER_RESET_ENVIRONMENT": "1"}
 
 
 # --------------------------------------------------------------------------- XDG (pure)

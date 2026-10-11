@@ -98,7 +98,8 @@ class Repository:
     """Data access over one SQLite connection (autocommit; use :meth:`transaction` for batches).
 
     ``Repository(path)`` opens/verifies/migrates the database file (corrupt files are quarantined
-    and ``kv['recovered_from']`` is set); ``Repository(":memory:")`` and ``Repository(conn)``
+    and ``kv['recovered_from']`` is set; a locked or unreachable file raises
+    :class:`~madhura.data.db.DatabaseUnavailable`); ``Repository(":memory:")`` and ``Repository(conn)``
     are also accepted. *today_fn* supplies the logical date when ``add_task`` gets no plan_date.
     """
 
@@ -345,6 +346,25 @@ class Repository:
             params.extend(values)
         sql += " ORDER BY started_at, id"
         return [self._session(r) for r in self._all(sql, params)]
+
+    def focus_seconds_by_day(
+        self, end_dt: datetime, day_start_hour: int, exclude_ids: Iterable[int] = ()
+    ) -> dict[date, int]:
+        """Counted focus seconds per logical date (days start at *day_start_hour*) of every session
+        started before *end_dt* — summed in SQL, so all-time totals (e.g. the best goal streak)
+        don't load every session. Sessions in *exclude_ids* are left out."""
+        values = [_sql_value(o) for o in COUNTED_OUTCOMES]
+        sql = (
+            "SELECT date(started_at, ?) AS day, SUM(MAX(0, focused_seconds)) AS secs FROM sessions"
+            f" WHERE started_at < ? AND outcome IN ({', '.join('?' for _ in values)})"
+        )
+        params: list[Any] = [f"-{int(day_start_hour)} hours", to_iso(end_dt), *values]
+        excluded = sorted({int(i) for i in exclude_ids})
+        if excluded:
+            sql += f" AND id NOT IN ({', '.join('?' for _ in excluded)})"
+            params.extend(excluded)
+        sql += " GROUP BY day"
+        return {date.fromisoformat(r["day"]): int(r["secs"] or 0) for r in self._all(sql, params) if r["day"]}
 
     def recent_sessions(
         self,

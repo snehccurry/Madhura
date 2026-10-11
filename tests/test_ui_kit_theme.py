@@ -246,6 +246,45 @@ def test_icon_modes_and_cache(_theme: theme.ThemeManager) -> None:
     assert not icons._pixmap_cache  # noqa: SLF001 - cleared on theme change
 
 
+def test_icon_caches_stay_bounded_under_hover_fades(_theme: theme.ThemeManager) -> None:
+    """Hover fades ask for a new interpolated colour every frame: the SVG is parsed once per icon
+    and the tinted pixmaps live in a bounded LRU (no unbounded growth until the next theme
+    change), while static icons in use survive the churn."""
+    icons.clear_cache()
+    pal = _theme.palette
+    static = icons.pixmap("logo", 18, pal.accent, 1.0)
+    for sweep in range(12):
+        for name in ("target", "repeat", "chart", "settings"):
+            for i in range(200):
+                icons.pixmap(name, 18, theme.mix(pal.text_muted, pal.text, i / 199), 1.0)
+            assert icons.pixmap("logo", 18, pal.accent, 1.0) is static  # recently used: kept
+    assert len(icons._renderer_cache) <= len(icons.ICON_NAMES)  # noqa: SLF001 - one per icon
+    assert len(icons._pixmap_cache) <= icons._PIXMAP_LIMIT  # noqa: SLF001
+    assert len(icons._mask_cache) <= 5  # noqa: SLF001 - one per (icon, device size)
+
+
+def test_tinted_icon_matches_the_svg_in_that_colour() -> None:
+    from PySide6.QtCore import QByteArray, QRectF, Qt
+    from PySide6.QtGui import QImage, QPainter
+    from PySide6.QtSvg import QSvgRenderer
+
+    for name, size, dpr, color in (("check", 18, 1.0, "#7A86FF"), ("pause", 16, 1.5, "#A0A6B2"), ("settings", 14, 2.0, "#FFFFFF")):
+        side = round(size * dpr)
+        ref = QImage(side, side, QImage.Format.Format_ARGB32_Premultiplied)
+        ref.fill(Qt.GlobalColor.transparent)
+        p = QPainter(ref)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        QSvgRenderer(QByteArray(icons.svg(name, color).encode())).render(p, QRectF(0, 0, side, side))
+        p.end()
+        got = icons.pixmap(name, size, color, dpr).toImage().convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+        assert got.size() == ref.size()
+        worst = max(
+            abs(((ref.pixel(x, y) >> s) & 255) - ((got.pixel(x, y) >> s) & 255))
+            for y in range(side) for x in range(side) for s in (0, 8, 16, 24)
+        )
+        assert worst <= 2, (name, worst)
+
+
 def test_icon_scaled_pixmap_is_crisp() -> None:
     pm = icons.icon("target").pixmap(QSize(18, 18), 1.5)
     assert pm.width() == 27

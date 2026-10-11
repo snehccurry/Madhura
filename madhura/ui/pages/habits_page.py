@@ -48,6 +48,7 @@ from madhura.ui.pages._habit_kit import (
     fmt_hhmm,
 )
 from madhura.ui.pages.habit_editor import SUGGESTIONS, HabitEditorSheet
+from madhura.ui.shortcuts_sheet import display_keys
 from madhura.ui.widgets.buttons import Button, IconButton
 from madhura.ui.widgets.card import Card
 from madhura.ui.widgets.chips import Chip
@@ -117,8 +118,9 @@ def build_models(ctx: AppContext) -> tuple[list[RowModel], list[Habit]]:
     archived = [h for h in everything if h.archived]
     if not habits:
         return [], archived
-    start = min((hcore.created_date(h) or today) for h in habits)
-    # one extra day: a habit created just after midnight may hold a log for the previous logical day
+    start = min((hcore.created_date(h, day_start_hour=dsh) or today) for h in habits)
+    # one extra day: auto-complete may log the logical day before creation (a session that began
+    # then), and changing the day start can move a creation date past its first log
     start = min(start, today - timedelta(days=7)) - timedelta(days=1)
     by_habit: dict[int, list[HabitLog]] = defaultdict(list)
     for lg in repo.habit_logs_between(start, today):
@@ -132,11 +134,11 @@ def build_models(ctx: AppContext) -> tuple[list[RowModel], list[Habit]]:
         status = next((str(lg.status) for lg in logs if lg.date == today), None)
         state = status if status in ("done", "skipped") else "none"
         scheduled = hcore.is_scheduled(h, today)
-        current, best = hcore.habit_streak(h, logs, today)
+        current, best = hcore.habit_streak(h, logs, today, day_start_hour=dsh)
         auto_minutes = hcore.focused_minutes(sessions, h.project) if h.is_auto else None
         due = hcore.due_at(h, today, dsh)
         pending = scheduled and state == "none" and due is not None and now >= due
-        missed = scheduled and state == "none" and hcore.missed_yesterday(h, logs, today)
+        missed = scheduled and state == "none" and hcore.missed_yesterday(h, logs, today, day_start_hour=dsh)
         caption, tone = _caption(h, state, scheduled, auto_minutes, pending, missed, today, use_24h)
         models.append(
             RowModel(
@@ -146,7 +148,7 @@ def build_models(ctx: AppContext) -> tuple[list[RowModel], list[Habit]]:
                 state=state,
                 caption=caption,
                 caption_tone=tone,
-                last7=hcore.last_7(h, logs, today),
+                last7=hcore.last_7(h, logs, today, day_start_hour=dsh),
                 streak=current,
                 best=best,
                 auto_minutes=auto_minutes,
@@ -432,7 +434,7 @@ class HabitsPage(PageScroll):
         self._last_today: date | None = None
 
         self.new_button = Button("New habit", "primary", icon="plus", parent=self.column)
-        self.new_button.setToolTip("New habit · Ctrl+N")
+        self.new_button.setToolTip(f"New habit · {display_keys('Ctrl+N')}")
         self.new_button.clicked.connect(lambda: self.new_habit())
         self.header = PageHeader("Habits", [self.new_button], self.column, subtitle=MOTTO)
         self.add(self.header)
@@ -771,7 +773,7 @@ class HabitsPage(PageScroll):
         model = self._models.get(int(habit_id))
         if row is None or model is None:
             return None
-        menu = Menu(self)
+        menu = Menu(self, delete_on_hide=True)
         menu.add_action("Edit", lambda: self.edit_habit(habit_id), icon="edit", shortcut_text="E")
         skipped = model.state == "skipped"
         menu.add_action("Unskip" if skipped else "Skip today", lambda: self.toggle_skip(habit_id), icon="skip", shortcut_text="S")

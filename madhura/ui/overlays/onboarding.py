@@ -42,6 +42,7 @@ from madhura.core.timefmt import fmt_preset, fmt_time
 from madhura.platform import autostart
 from madhura.ui import animations, fonts, icons, theme
 from madhura.ui.pages._settings_kit import NUDGE_CHOICES, BackupFailed, import_legacy, shorten_path, work_hours_hint
+from madhura.ui.shortcuts_sheet import display_keys
 from madhura.ui.widgets._common import KeyboardFocusMixin, fill_rounded
 from madhura.ui.widgets.buttons import Button
 from madhura.ui.widgets.chips import ChipGroup, DayChips
@@ -64,7 +65,7 @@ GOAL_OPTIONS: tuple[tuple[int, str], ...] = ((60, "1h"), (120, "2h"), (180, "3h"
 #: Welcome-step benefit rows: (icon, title, caption).
 BENEFITS: tuple[tuple[str, str, str], ...] = (
     ("target", "Plan one block at a time", "Decide what the next hour is for, then lock in."),
-    ("check_circle", "Gentle check-ins keep you honest", "A quiet “still on it?” every few minutes. Only you see it."),
+    ("check_circle", "Gentle check-ins keep you honest", "A quiet “Still on it?” every few minutes. Only you see it."),
     ("repeat", "Habits that compound", "Improve by 1% every day — small wins add up."),
 )
 STEP_TITLES: tuple[str, ...] = ("Welcome", "Your day", "Accountability", "First block")
@@ -608,7 +609,7 @@ class OnboardingSheet(SheetContent):
         row.addWidget(self.duration_chips, 1, Qt.AlignmentFlag.AlignVCenter)
         self.lock_in_button = Button("Lock in", "primary", icon="play", size="lg", parent=page)
         self.lock_in_button.setMinimumWidth(140)
-        self.lock_in_button.setToolTip("Lock in · Ctrl+Enter")
+        self.lock_in_button.setToolTip(f"Lock in · {display_keys('Ctrl+Enter')}")
         self.lock_in_button.clicked.connect(self.lock_in)
         row.addWidget(self.lock_in_button, 0, Qt.AlignmentFlag.AlignVCenter)
         lay.addLayout(row)

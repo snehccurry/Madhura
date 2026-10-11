@@ -14,7 +14,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QKeyEvent, QPainter, QPaintEvent
 from PySide6.QtWidgets import QAbstractButton, QCompleter, QGridLayout, QHBoxLayout, QVBoxLayout, QWidget
 
@@ -22,6 +22,7 @@ from madhura.core.days import ALL_DAYS, WEEKDAYS, WEEKENDS
 from madhura.core.models import Habit
 from madhura.ui import fonts, icons, theme
 from madhura.ui.pages._habit_kit import CURATED_EMOJI, emoji_font, first_grapheme
+from madhura.ui.shortcuts_sheet import display_keys
 from madhura.ui.widgets.buttons import Button, LinkButton
 from madhura.ui.widgets.chips import ChipGroup, DayChips
 from madhura.ui.widgets.inputs import Stepper, TextField, TimeField
@@ -444,7 +445,7 @@ class HabitEditorSheet(SheetContent):
         self.cancel_button = Button("Cancel", "ghost", parent=self)
         self.cancel_button.clicked.connect(self.close_sheet)
         self.save_button = Button("Save" if editing else "Create habit", "primary", parent=self)
-        self.save_button.setToolTip("Save · Ctrl+Enter")
+        self.save_button.setToolTip(f"Save · {display_keys('Ctrl+Enter')}")
         self.save_button.clicked.connect(self.save)
         self.add_footer_button(self.cancel_button)
         self.add_footer_button(self.save_button, primary=True)
@@ -563,6 +564,8 @@ class HabitEditorSheet(SheetContent):
         has_time = self.time_toggle.isChecked()
         self.time_field.setVisible(has_time)
         self.reminder_toggle.setEnabled(has_time)
+        # dim the title like the (disabled) urgent row below; the "needs a time" hint stays readable
+        self.reminder_row.title.setEnabled(has_time)
         self.reminder_toggle.setChecked(self._reminder_pref if has_time else False)
         self.reminder_row.set_description("" if has_time else "Reminders need a time")
         self._sync_urgent()
@@ -597,6 +600,7 @@ class HabitEditorSheet(SheetContent):
         pop = Popover(self.emoji_button, picker, align="left")
         picker.picked.connect(self._on_picked)
         pop.closed.connect(lambda: setattr(self, "_popover", None))
+        pop.closed.connect(pop.deleteLater)  # one popover per opening; don't pile them up on the window
         self._popover = pop
         pop.open()
 
@@ -612,6 +616,22 @@ class HabitEditorSheet(SheetContent):
 
     def initial_focus_widget(self) -> QWidget | None:
         return self.name_field.line_edit
+
+    def on_shown(self) -> None:
+        """Once the host has focused the name (its own zero-delay call, queued just before this
+        one), a prefilled name is ready to retype or edit rather than leaving the cursor at its
+        start: selected for a new habit (as when a suggestion chip is clicked), cursor at the end
+        when editing."""
+        QTimer.singleShot(0, self, self._place_name_cursor)
+
+    def _place_name_cursor(self) -> None:
+        edit = self.name_field.line_edit
+        if not edit.hasFocus() or not edit.text() or edit.hasSelectedText():
+            return
+        if self.is_editing():
+            edit.end(False)
+        else:
+            edit.selectAll()
 
     # ------------------------------------------------------------------ save
     def values(self) -> dict[str, Any]:

@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import sqlite3
+import urllib.parse
 from datetime import date
 from pathlib import Path
 
@@ -93,9 +94,22 @@ def staged_restore_path(db_path: Path | None = None) -> Path:
     return db_path.with_name(db_path.name + ".restore")
 
 
+def _read_only_uri(path: Path) -> str:
+    """``file:`` URI opening *path* read-only.
+
+    Percent-encoded, so '#', '?' and '%' in folder names work. Empty authority:
+    ``file:///home/…``, ``file:///C:/…`` (SQLite drops the '/' before a drive letter) and
+    ``file:////server/share/…`` for UNC paths.
+    """
+    posix = path.absolute().as_posix()
+    if not posix.startswith("/"):
+        posix = "/" + posix
+    return f"file://{urllib.parse.quote(posix, safe='/:')}?mode=ro"
+
+
 def _verify_sqlite(path: Path) -> None:
     try:
-        conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        conn = sqlite3.connect(_read_only_uri(path), uri=True)
     except sqlite3.Error as exc:
         raise ValueError(f"{path.name} is not a Madhura database") from exc
     try:
@@ -119,9 +133,17 @@ def stage_restore(path: str | os.PathLike[str], db_path: Path | None = None) -> 
         raise ValueError(f"{source} does not exist")
     _verify_sqlite(source)
     target = staged_restore_path(db_path)
-    tmp = target.with_name(target.name + ".tmp")
-    shutil.copyfile(source, tmp)
-    os.replace(tmp, target)
+    # An online copy, not a file copy: commits still in the source's -wal (a madhura.db copied
+    # from a running/crashed app, a quarantined file) are part of what was just verified and
+    # must be part of what is restored. The result is one standalone file (atomic replace).
+    try:
+        src = sqlite3.connect(_read_only_uri(source), uri=True)
+        try:
+            dbmod.backup_to(src, target)
+        finally:
+            src.close()
+    except sqlite3.Error as exc:
+        raise ValueError(f"{source.name} could not be read") from exc
     log.info("Staged %s for restore", source)
     return target
 

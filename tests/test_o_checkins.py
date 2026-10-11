@@ -17,7 +17,7 @@ from test_o_support import (  # noqa: F401
 )
 
 from madhura.context import AppContext, FakeWindowController
-from madhura.services.checkin_service import INTRO_KEY
+from madhura.services.checkin_service import INTRO_KEY, REASON_FALLBACK_SECONDS
 from madhura.ui.overlays.checkin_popup import CheckInPopup, confirmation_text, meta_text
 from madhura.ui.widgets.popup import PopupStack
 
@@ -252,12 +252,53 @@ def test_popup_focusing_back_with_reason(octx: AppContext) -> None:  # noqa: F81
     popup.back_button.click()
     assert popup.phase() == "reason"
     assert popup.reasons.isVisibleTo(popup)
-    # the answer is decided: the prompt timeout no longer runs
+    # the answer is decided: the prompt timeout no longer runs (hovering holds the reason step)
+    popup.hover_changed.emit(True)
     advance(octx, 120)
     assert records(octx) == []
     popup.choose_reason("Messages")
     assert records(octx) == [("drifted", "Messages")]
     assert popup.confirmation() == "Back to Write the report."
+
+
+def test_reason_step_that_never_answers_still_records_drifted(octx: AppContext) -> None:  # noqa: F811
+    ck = octx.checkins
+    start(octx)
+    run_to_prompt(octx)
+    popup = ck.popup
+    popup.answer_back()
+    popup._reason_countdown.stop()  # noqa: SLF001 - as if the popup's 6 s timer were lost
+    assert ck.timeout_progress() == pytest.approx(1.0)
+    advance(octx, REASON_FALLBACK_SECONDS - 2, 1)
+    assert records(octx) == [] and ck.prompt_mode == "popup"
+    advance(octx, 3, 1)
+    assert records(octx) == [("drifted", None)]
+    assert ck.prompt_mode is None
+    run_to_prompt(octx)  # the schedule goes on
+    assert ck.prompt_mode == "popup"
+
+
+def test_inline_focusing_back_then_leaving_the_window_records_drifted(
+    qapp: QApplication, data_dir: Any, fake_clock: Any
+) -> None:
+    win = FakeWindowController(page="focus", visible=True, active=True)
+    ctx = make_octx(qapp, data_dir, fake_clock, window=win)
+    try:
+        ck = ctx.checkins
+        answered: list[str] = []
+        ck.answered.connect(answered.append)
+        start(ctx)
+        run_to_prompt(ctx)
+        assert ck.prompt_mode == "inline"
+        ck.begin_reason()  # "Focusing back" on the Focus page strip
+        win.active = False  # ... and the user switches to their work app within the 6 s
+        advance(ctx, 2, 1)
+        assert records(ctx) == [("drifted", None)] and answered == ["drifted"]
+        assert ck.prompt_mode is None and ck.popup is None  # not asked again in a popup
+        run_to_prompt(ctx)  # later check-ins still fire
+        assert ck.prompt_mode == "popup"
+    finally:
+        dispose_octx(ctx, qapp)
 
 
 def test_reason_step_times_out_to_drifted_without_reason(octx: AppContext) -> None:  # noqa: F811
@@ -353,6 +394,8 @@ def test_two_consecutive_misses_pause_at_the_first_fire(octx: AppContext) -> Non
     octx.engine.resume()
     assert ck.paused_by_misses is False
     assert octx.pill.pill.time_text() != "Paused · were you away?"
+    # the focus after the first miss was rolled back: the next check-in is one interval away
+    assert ck.seconds_until_next() == pytest.approx(BASE, abs=1)
 
 
 def test_an_answer_between_misses_resets_the_rule(octx: AppContext) -> None:  # noqa: F811

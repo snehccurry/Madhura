@@ -104,6 +104,30 @@ def test_sessions_between_and_recent(repo: Repository) -> None:
     assert [s.id for s in repo.active_sessions()] == [d]
 
 
+def test_focus_seconds_by_day(repo: Repository) -> None:
+    """Per logical day, counted outcomes only, summed in SQL; same days as core.days.logical_date."""
+    from madhura.core.days import logical_date
+
+    late = datetime(2026, 10, 14, 2, 30)  # before the 04:00 day start → Tue 13 Oct
+    a = make_session(repo, start=late, outcome="completed", focused_seconds=1800)
+    make_session(repo, start=datetime(2026, 10, 13, 9, 0), outcome="ended_early", focused_seconds=600)
+    make_session(repo, start=datetime(2026, 10, 13, 10, 0), outcome="abandoned", focused_seconds=900)
+    make_session(repo, start=datetime(2026, 10, 13, 11, 0))  # active
+    b = make_session(repo, start=T0, outcome="completed", focused_seconds=1500)
+    make_session(repo, start=datetime(1999, 12, 31, 23, 0), outcome="completed", focused_seconds=60)
+    make_session(repo, start=datetime(2026, 10, 15, 4, 0), outcome="completed", focused_seconds=99)  # at end: out
+    end = datetime(2026, 10, 15, 4, 0)
+    assert logical_date(late, 4) == date(2026, 10, 13)
+    assert repo.focus_seconds_by_day(end, 4) == {
+        date(1999, 12, 31): 60, date(2026, 10, 13): 2400, date(2026, 10, 14): 1500,
+    }
+    assert repo.focus_seconds_by_day(end, 0) == {
+        date(1999, 12, 31): 60, date(2026, 10, 13): 600, date(2026, 10, 14): 3300,
+    }
+    assert repo.focus_seconds_by_day(end, 4, {a, b}) == {date(1999, 12, 31): 60, date(2026, 10, 13): 600}
+    assert repo.focus_seconds_by_day(datetime(2000, 1, 1), 4, [999]) == {date(1999, 12, 31): 60}
+
+
 def test_recent_titles_and_projects(repo: Repository, fake_clock: FakeClock) -> None:
     make_session(repo, "Old", start=T0 - timedelta(days=2), project="Alpha")
     make_session(repo, "Newer", start=T0 - timedelta(days=1), project="Beta")

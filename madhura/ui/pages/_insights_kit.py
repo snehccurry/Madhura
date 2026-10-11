@@ -47,7 +47,6 @@ HEATMAP_MIN_SESSIONS = 3
 #: "Recent sessions" shows at most this many rows.
 RECENT_LIMIT = 50
 
-_EPOCH = datetime(1970, 1, 1)
 _FAR_FUTURE = datetime(9999, 1, 1)
 
 
@@ -242,14 +241,20 @@ def load_snapshot(ctx: AppContext, range_key: str, exclude: Iterable[int] = ()) 
 
     habits = repo.habits()
     logs = repo.habit_logs_between(prev.start, period.end)
-    snap.habit_done, snap.habit_scheduled = an.habit_completion_counts(habits, logs, period.start, period.end, today=today)
+    snap.habit_done, snap.habit_scheduled = an.habit_completion_counts(
+        habits, logs, period.start, period.end, today=today, day_start_hour=hour
+    )
     snap.habit_rate = snap.habit_done / snap.habit_scheduled if snap.habit_scheduled else None
-    snap.prev_habit_rate = an.habit_completion(habits, logs, prev.start, prev.end, today=today)
+    snap.prev_habit_rate = an.habit_completion(habits, logs, prev.start, prev.end, today=today, day_start_hour=hour)
 
     goal_minutes = int(settings.get("daily_goal_minutes"))
     work_days = int(settings.get("work_days"))
-    history = _without(repo.sessions_between(_EPOCH, end), excluded)
-    snap.streak = day_streak(an.goal_dates(history, goal_minutes, hour), today, work_days)
+    # All-time streaks (a best streak may be older than any range): per-day totals summed in SQL,
+    # so a refresh doesn't load the whole session history.
+    goal = goal_minutes * 60
+    totals = repo.focus_seconds_by_day(end, hour, excluded)
+    met = {d for d, secs in totals.items() if secs >= goal} if goal > 0 else set()
+    snap.streak = day_streak(met, today, work_days)
 
     snap.daily_goal_seconds = goal_minutes * 60
     if range_key == "12w":

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from madhura import paths
+from madhura.log import warn_once
 
 __all__ = ["SoundPlayer", "EVENTS", "PRIORITY", "COALESCE_SECONDS"]
 
@@ -57,6 +58,7 @@ class SoundPlayer:
         self._last_priority = 0
         self._linux_player: str | None = None
         self._linux_resolved = False
+        self._warned: set[str] = set()
 
     # ------------------------------------------------------------------ config
 
@@ -137,7 +139,7 @@ class SoundPlayer:
     # ------------------------------------------------------------------ audio
 
     def scaled_wav(self, volume: int) -> Path:
-        """Path of the chime pre-scaled by gain (volume/100)² (cached per volume)."""
+        """Path of the chime pre-scaled by gain (volume/100)² (cached for the current volume only)."""
         volume = max(0, min(100, int(volume)))
         target = self._cache() / f"chime_v{volume}.wav"
         if target.exists() and target.stat().st_size > 44:
@@ -148,6 +150,7 @@ class SoundPlayer:
             frames = src.readframes(params.nframes)
         if params.sampwidth != 2:
             shutil.copyfile(self._source, target)
+            self._prune_cache(target)
             return target
         samples = array("h")
         samples.frombytes(frames[: len(frames) - len(frames) % 2])
@@ -163,7 +166,23 @@ class SoundPlayer:
             dst.setframerate(params.framerate)
             dst.writeframes(scaled.tobytes())
         os.replace(tmp, target)
+        self._prune_cache(target)
         return target
+
+    @staticmethod
+    def _prune_cache(keep: Path) -> None:
+        """Delete the chimes cached for other volumes and stale temp files (≈0.5 MB each).
+
+        A file the OS is still playing may refuse deletion (Windows); it is skipped and retried
+        on the next write.
+        """
+        for item in keep.parent.glob("chime_v*"):
+            if item == keep:
+                continue
+            try:
+                item.unlink()
+            except OSError:
+                log.debug("Could not delete cached sound %s", item, exc_info=True)
 
     def _launch(self, path: Path) -> bool:
         try:
@@ -176,15 +195,17 @@ class SoundPlayer:
             from PySide6.QtCore import QProcess
 
             if sys.platform == "darwin":
-                ok = QProcess.startDetached("afplay", [str(path)])
+                player: str | None = "afplay"
             else:
                 player = self._find_linux_player()
                 if player is None:
                     return False
-                ok = QProcess.startDetached(player, [str(path)])
-            return bool(ok[0] if isinstance(ok, tuple) else ok)
+            ok = QProcess.startDetached(player, [str(path)])
+            if not (ok[0] if isinstance(ok, tuple) else ok):
+                raise OSError(f"could not start {player}")
+            return True
         except Exception:  # noqa: BLE001 - sound must never crash the app
-            log.debug("Sound playback failed", exc_info=True)
+            warn_once(log, self._warned, "launch", "Sound playback failed")
             return False
 
     def _find_linux_player(self) -> str | None:
@@ -195,4 +216,6 @@ class SoundPlayer:
                 if found:
                     self._linux_player = found
                     break
+            else:
+                log.warning("No audio player found (%s); sounds are off", ", ".join(_LINUX_PLAYERS))
         return self._linux_player

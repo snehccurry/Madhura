@@ -14,9 +14,9 @@ available-geometry edge snaps to a 12 px inset (160 ms). The position is persist
 screen or an off-screen rect falls back to the bottom-right corner of the primary screen (inset 16).
 
 States: focus (accent ring), paused (pause glyph, muted time; "Paused · were you away?" after two
-missed check-ins), break (coffee glyph, break colour), done (success check + "Done" for 3 s, then
-hidden). Window opacity 0.94, 1.0 on hover. At 120 s left the border pulses once per session
-(skipped with reduce-motion).
+missed check-ins or an away pause), break (coffee glyph, break colour), done (success check +
+"Done" for 3 s, then hidden). Window opacity 0.94, 1.0 on hover. At 120 s left the border pulses
+once per session (skipped with reduce-motion).
 
 Visibility (PillController): state ≠ IDLE and (pill_mode "always" or (pill_mode "hidden" and the
 main window is not visible)) and not hidden by the user (tray toggle; resets when the session
@@ -919,7 +919,10 @@ class PillController(QObject):
         label = ""
         if state == "paused":
             checkins = ctx.checkins
-            if checkins is not None and getattr(checkins, "paused_by_misses", False):
+            away = ctx.away
+            if (checkins is not None and getattr(checkins, "paused_by_misses", False)) or (
+                away is not None and getattr(away, "paused_while_away", False)
+            ):
                 label = MISSED_TEXT
         self._pill.set_display(
             state,
@@ -1026,7 +1029,7 @@ class PillController(QObject):
         """The right-click menu: Pause/Resume, +5 min, Finish, Open Madhura, Hide mini timer."""
         engine = self._ctx.engine
         state = str(engine.state)
-        menu = Menu(self._pill)
+        menu = Menu(self._pill, delete_on_hide=True)
         if state == "break":
             menu.add_action("End break", engine.skip_break, icon="skip")
         else:

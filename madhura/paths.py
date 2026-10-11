@@ -200,12 +200,32 @@ def _scan(root: Path, depth: int, found: list[Path], seen: set[Path], budget: li
             continue
 
 
+def _os_user_folders() -> list[Path]:
+    """Desktop and Downloads where the OS keeps them: OneDrive-redirected known folders on
+    Windows (SHGetKnownFolderPath), localized XDG dirs such as ~/Schreibtisch on Linux."""
+    try:
+        from PySide6.QtCore import QStandardPaths
+    except ImportError:
+        return []
+    found: list[Path] = []
+    for location in (QStandardPaths.StandardLocation.DesktopLocation, QStandardPaths.StandardLocation.DownloadLocation):
+        try:
+            text = QStandardPaths.writableLocation(location)
+        except Exception:  # noqa: BLE001 - detection is best effort
+            log.debug("QStandardPaths lookup failed", exc_info=True)
+            continue
+        if text:
+            found.append(Path(text))
+    return found
+
+
 def legacy_habits_candidates(
     roots: Iterable[Path] | None = None, depth: int = 2, max_dirs_per_root: int = 400
 ) -> list[Path]:
     """Find old TinyDB ``habits.json`` files (containing ``"_default"``).
 
-    Default roots: cwd, dirname(sys.executable), ~/Desktop, ~/Downloads. Each root is scanned
+    Default roots: cwd, dirname(sys.executable), the OS Desktop and Downloads folders (which may
+    be redirected or localized), ~/Desktop, ~/Downloads. Each root is scanned
     to *depth* directory levels below it (root itself, children, grandchildren), visiting at most
     *max_dirs_per_root* directories (hidden, ``$``-prefixed and dependency folders skipped) so a
     huge cwd such as System32 stays fast. Returns existing, de-duplicated files in discovery
@@ -216,6 +236,7 @@ def legacy_habits_candidates(
         roots = [
             Path.cwd(),
             Path(sys.executable).resolve().parent,
+            *_os_user_folders(),
             home / "Desktop",
             home / "Downloads",
         ]

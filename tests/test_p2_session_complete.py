@@ -157,9 +157,12 @@ def test_active_window_gets_the_sheet_and_sound(active: AppContext, sounds: list
     assert sheet.title_text() == "Session complete"
     assert sounds == ["complete"]
     assert panel_of(active) is None
-    assert active.repo.kv_get(sc.PENDING_KEY) is None
+    assert active.repo.kv_get(sc.PENDING_KEY) == sid  # until closed: a quit brings it back
     present_session_complete(active, sid, "completed", False)  # duplicate → same sheet
     assert active.window.sheet_host.queued() == []  # type: ignore[union-attr]
+    sheet.done_button.click()
+    pump()
+    assert active.repo.kv_get(sc.PENDING_KEY) is None
 
 
 def test_inactive_window_gets_the_panel_and_a_pending_sheet(inactive: AppContext, sounds: list[str]) -> None:
@@ -360,7 +363,7 @@ def test_auto_break_running_shows_done_and_keep_going(active: AppContext) -> Non
 def test_sheet_while_a_session_runs_offers_only_done(active: AppContext) -> None:
     sid = make_session(active)
     active.engine.start("Something else", 25)
-    sheet = SessionCompleteSheet(active, sid, "completed", pending=True)
+    sheet = SessionCompleteSheet(active, sid, "completed")
     active.window.show_sheet(sheet)  # type: ignore[union-attr]
     assert not sheet.keep_button.isVisibleTo(sheet)
     assert not sheet.main_button.isVisibleTo(sheet)
@@ -400,7 +403,7 @@ def test_panel_actions(inactive: AppContext) -> None:
     assert panel.score_label.text() == "1 of 2 focused"
     assert panel.main_button.text() == "Take a 5-min break"
     assert panel.keep_button.text() == "Keep going +15"
-    assert panel.done_button.text() == "Done"
+    assert panel.done_button.accessibleName() == "Done" and panel.done_button.toolTip() == "Done"
     for b in (panel.main_button, panel.keep_button, panel.done_button):
         assert b.focusPolicy() == Qt.FocusPolicy.NoFocus
     panel.main_button.click()
@@ -580,3 +583,187 @@ def test_card_refits_when_actions_change(active: AppContext) -> None:
     active.engine.start("Something else", 25)  # footer shrinks to "Done"
     pump()
     assert host.card_geometry().height() < full - 30
+
+
+# --------------------------------------------------------------------------- quit / logoff with a sheet open
+
+
+def test_quit_or_logoff_saves_the_note_and_keeps_the_sheet_pending(active: AppContext) -> None:
+    """flush_data (commitDataRequest, and the first step of shutdown) saves the typed note
+    without closing the sheet or applying "Mark done"; kv pending brings the sheet back."""
+    from madhura.app import flush_data
+
+    tid = active.repo.add_task("Write", 25, plan_date=active.today())
+    sid = make_session(active, task="Write", task_id=tid)
+    present_session_complete(active, sid, "completed", False)
+    sheet = current_sheet(active)
+    assert sheet.mark_done is not None and sheet.mark_done.isChecked()
+    sheet.note.set_text("Numbers need a second look")
+    flush_data(active)
+    assert active.repo.get_session(sid).note == "Numbers need a second look"
+    assert not active.repo.get_task(tid).done  # "Mark done" waits for the user's confirmation
+    assert active.repo.kv_get(sc.PENDING_KEY) == sid
+    assert current_sheet(active) is sheet  # still open (e.g. the logoff was cancelled)
+
+    # The next launch's pending sheet: note filled in, "Mark done" checked for confirmation.
+    again = SessionCompleteSheet(active, sid, "completed", pending=True)
+    assert again.note.text() == "Numbers need a second look"
+    assert again.mark_done is not None and again.mark_done.isChecked()
+    again.deleteLater()
+
+    # A cancelled logoff: the open sheet keeps working and commits everything when closed.
+    sheet.note.set_text("Checked the numbers")
+    sheet.done_button.click()
+    pump()
+    assert active.repo.get_session(sid).note == "Checked the numbers"
+    assert active.repo.get_task(tid).done
+    assert active.repo.kv_get(sc.PENDING_KEY) is None
+
+
+def test_flush_points_pending_at_an_open_sheet(active: AppContext) -> None:
+    from madhura.app import flush_data
+
+    sid = make_session(active)
+    present_session_complete(active, sid, "completed", False)
+    active.repo.kv_set(sc.PENDING_KEY, None)  # e.g. a later panel's "Keep going" cleared it
+    flush_data(active)
+    assert active.repo.kv_get(sc.PENDING_KEY) == sid
+    assert active.repo.get_session(sid).note is None  # nothing typed → nothing written
+
+
+# --------------------------------------------------------------------------- stale pending sheets
+
+
+def _finish_now(ctx: AppContext, task: str = "Write") -> int:
+    """A completed session that ended at the FakeClock's now."""
+    now = ctx.clock.now().replace(microsecond=0)
+    sid = ctx.repo.create_session(task, None, None, now, 25 * 60)
+    ctx.repo.update_session(sid, focused_seconds=25 * 60, outcome="completed", ended_at=now)
+    return sid
+
+
+def test_late_pending_sheet_only_offers_done(shell: AppContext) -> None:  # noqa: F811
+    shell.window.show_main()  # type: ignore[union-attr]
+    pump()
+    sid = make_session(shell)  # ended 09:45; the clock says 10:00
+    shell.repo.kv_set(sc.PENDING_KEY, sid)
+    sheet = show_pending_complete(shell)
+    assert sheet is not None and sheet.pending and not sheet.offers_actions
+    for w in (sheet.main_button, sheet.keep_button, sheet.break_row):
+        assert not w.isVisibleTo(sheet)
+    assert sheet.done_button.variant() == "primary" and sheet.primary_button() is sheet.done_button
+
+
+def test_fresh_pending_sheet_still_offers_the_break(shell: AppContext) -> None:  # noqa: F811
+    shell.window.show_main()  # type: ignore[union-attr]
+    pump()
+    sid = _finish_now(shell)
+    shell.repo.kv_set(sc.PENDING_KEY, sid)
+    sheet = show_pending_complete(shell)
+    assert sheet is not None and sheet.offers_actions
+    assert sheet.main_button.isVisibleTo(sheet) and sheet.main_button.text() == "Take a 5-min break"
+    assert sheet.keep_button.isVisibleTo(sheet)
+
+
+def test_pending_sheet_after_another_session_only_offers_done(shell: AppContext) -> None:  # noqa: F811
+    shell.window.show_main()  # type: ignore[union-attr]
+    pump()
+    sid = _finish_now(shell, "First")
+    _finish_now(shell, "Second")  # a later session ran (and ended) since
+    sheet = SessionCompleteSheet(shell, sid, "completed", pending=True)
+    assert not sheet.offers_actions
+    sheet.deleteLater()
+
+
+def test_pending_sheet_after_the_panels_break_only_offers_done(inactive: AppContext, monkeypatch: pytest.MonkeyPatch) -> None:
+    eng = inactive.engine
+    eng.start("Write", 2)
+    advance(inactive, 121, step=30)
+    sid = eng_last_id(inactive)
+    panel = panel_of(inactive)
+    assert panel is not None and panel.session_id == sid
+    panel.main_button.click()  # Take a 5-min break (from the panel)
+    pump()
+    assert str(eng.state) == "break"
+    advance(inactive, 60, step=30)  # well inside the "still relevant" window
+    sheet = SessionCompleteSheet(inactive, sid, "completed", pending=True)
+    inactive.window.show_main()  # type: ignore[union-attr]
+    inactive.window.show_sheet(sheet)  # type: ignore[union-attr]
+    pump()
+    assert not sheet.offers_actions
+    assert not sheet.keep_button.isVisibleTo(sheet) and not sheet.main_button.isVisibleTo(sheet)
+    assert sheet.done_button.variant() == "primary"
+    sheet.close_sheet()
+    pump()
+
+
+# --------------------------------------------------------------------------- hidden-window outcomes
+
+
+def test_too_short_finish_from_the_pill_notifies(inactive: AppContext, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(inactive.window, "is_main_visible", lambda: False)
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(inactive.notifier, "notify", lambda t, b, *_a: sent.append((t, b)) or True)  # a tray
+    present_session_complete(inactive, 99999, "abandoned", False)  # the row was deleted
+    assert sent == [(sc.TOO_SHORT_TITLE, sc.TOO_SHORT_BODY)]
+    assert not inactive.window.toasts.is_showing()  # type: ignore[union-attr]
+    sid = make_session(inactive, outcome="abandoned", focused_s=300)
+    present_session_complete(inactive, sid, "abandoned", False)  # explicit abandon: no noise
+    assert len(sent) == 1
+    assert not inactive.window.toasts.is_showing()  # type: ignore[union-attr]
+
+
+def test_too_short_without_a_tray_waits_in_the_window(inactive: AppContext, monkeypatch: pytest.MonkeyPatch) -> None:
+    host = inactive.window.toasts  # type: ignore[union-attr]
+    assert not inactive.window.isVisible()  # type: ignore[union-attr]
+    present_session_complete(inactive, 99999, "abandoned", False)  # no tray: notify() can't show
+    assert host.text() == sc.TOO_SHORT_TITLE and host.is_held()
+
+
+def test_restored_notice_waits_for_the_window(shell: AppContext) -> None:  # noqa: F811
+    """Autostart into the tray: the restored toast's countdown starts when the window shows."""
+    win = shell.window
+    assert not win.isVisible()  # type: ignore[union-attr]
+    sid = make_session(shell, task="Write the report")
+    present_session_complete(shell, sid, "completed", True)
+    host = win.toasts  # type: ignore[union-attr]
+    assert host.is_showing() and host.is_held()
+    assert not host._timer.isActive()  # noqa: SLF001
+    win.show_main()  # type: ignore[union-attr]
+    pump()
+    assert not host.is_held() and host._timer.isActive()  # noqa: SLF001
+    assert host.text().startswith("Your session on ‘Write")
+
+
+# --------------------------------------------------------------------------- panel layout
+
+
+@pytest.mark.parametrize(("breaks", "minutes"), [(True, 5), (True, 10), (True, 15), (False, 5)])
+def test_panel_fits_the_standard_width_with_regular_buttons(inactive: AppContext, breaks: bool, minutes: int) -> None:
+    from madhura.ui.widgets.popup import PANEL_WIDTH, SHADOW_MARGIN
+
+    inactive.settings.update(breaks_enabled=breaks, break_minutes=minutes)
+    sid = make_session(inactive, task="Prepare slides for Thursday's sync with the whole design team")
+    present_session_complete(inactive, sid, "completed", False)
+    panel = panel_of(inactive)
+    pump()
+    assert panel.minimumSizeHint().width() <= PANEL_WIDTH + 2 * SHADOW_MARGIN
+    assert panel.card_size().width() == PANEL_WIDTH
+    assert panel.width() == PANEL_WIDTH + 2 * SHADOW_MARGIN
+    assert panel.main_button.height() == 36 and panel.keep_button.height() == 36  # "md", like the other panels
+    m, k = panel.main_button.geometry(), panel.keep_button.geometry()
+    assert m.left() == 0 and k.right() == panel.content().width() - 1  # full content width, no indent
+    assert panel.main_button.fontMetrics().horizontalAdvance(panel.main_button.text()) < m.width()
+    assert panel.done_button.accessibleName() == "Done"
+    assert panel.done_button.geometry().top() < panel.score_label.geometry().top()  # in the header
+
+
+def test_primary_tooltip_uses_the_platform_modifier(active: AppContext, monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from madhura.ui import shortcuts_sheet
+
+    monkeypatch.setattr(shortcuts_sheet, "sys", SimpleNamespace(platform="darwin"))
+    sid = make_session(active)
+    present_session_complete(active, sid, "completed", False)
+    assert current_sheet(active).main_button.toolTip() == "Take a 5-min break · ⌘+Enter"

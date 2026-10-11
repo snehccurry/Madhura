@@ -151,6 +151,11 @@ def _clear_layout(layout: QVBoxLayout) -> None:
             w.deleteLater()
 
 
+def _same_widgets(a: list[Any], b: list[Any]) -> bool:
+    """True when *a* and *b* hold the same widgets in the same order."""
+    return len(a) == len(b) and all(x is y for x, y in zip(a, b))
+
+
 def _quote(text: str, limit: int = 40) -> str:
     text = text.strip()
     if len(text) > limit:
@@ -179,7 +184,9 @@ class PlanCard(Card):
         self._custom_minutes: int | None = None
         self._planned_task_id: int | None = None
         self._prefill_title: str | None = None
+        self._draft_title: str | None = None  # the user's own text (cursor at the end on focus)
         self._last_project: dict[str, str] = {}
+        self._picked_title: str | None = None  # completer row highlighted (keyboard pick)
         self._arrow_nav = False
         self._one_row: bool | None = None
         self._custom_popover: Popover | None = None
@@ -200,6 +207,7 @@ class PlanCard(Card):
         self.task_field.set_max_length(200)
         self.task_field.returnPressed.connect(self.start)
         self.task_field.textChanged.connect(self._on_task_text)
+        self.task_field.textEdited.connect(self._on_task_edited)
         self.body.addWidget(self.task_field)
 
         self.duration = ChipGroup([], exclusive=True, parent=self, wrap=False)
@@ -249,6 +257,7 @@ class PlanCard(Card):
         self._task_completer = self._make_completer(self._task_model)
         self.task_field.set_completer(self._task_completer)
         self._task_completer.activated[str].connect(self._on_title_completed)
+        self._task_completer.highlighted[str].connect(self._on_title_highlighted)
         self._project_model = QStringListModel(self)
         self._project_completer = self._make_completer(self._project_model)
         self.project_field.set_completer(self._project_completer)
@@ -264,6 +273,9 @@ class PlanCard(Card):
         # Completer insertions don't always emit textEdited; any real text clears the error.
         if text.strip() and self.task_field.has_error():
             self.task_field.set_error(None)
+
+    def _on_task_edited(self, _text: str) -> None:
+        self._picked_title = None  # typed past the highlighted completion
 
     def _make_completer(self, model: QStringListModel) -> QCompleter:
         c = QCompleter(model, self)
@@ -451,7 +463,20 @@ class PlanCard(Card):
     def _sync_project_dot(self) -> None:
         self.project_field.set_leading_color(theme.project_color(self.project_field.text()))
 
+    def _on_title_highlighted(self, title: str) -> None:
+        self._picked_title = title
+
+    def _picked_project(self, title: str) -> str | None:
+        """The remembered project when *title* is the completer row the user picked."""
+        picked = self._picked_title
+        if picked is None or picked.strip().casefold() != title.strip().casefold():
+            return None
+        return self._last_project.get(title.casefold())
+
     def _on_title_completed(self, title: str) -> None:
+        self._picked_title = None
+        if self._ctx.engine.is_active:
+            return  # Return on the row already started the session (see start())
         if not self.project_field.text().strip():
             project = self._last_project.get(title.casefold())
             if project:
@@ -547,6 +572,8 @@ class PlanCard(Card):
     def prefill(self, task: PlannedTask | None) -> None:
         """Fill the card from an Up next item (title selected, its minutes) or clear it."""
         self.task_field.set_error(None)
+        self._draft_title = None
+        self._picked_title = None
         if task is None:
             self._planned_task_id = None
             self._prefill_title = None
@@ -558,6 +585,24 @@ class PlanCard(Card):
         self.task_field.set_text(task.title, select=True)
         self.project_field.set_text(task.project or "")
         self.set_minutes(task.minutes)
+
+    def set_draft(self, title: str, minutes: int) -> None:
+        """Fill the card with text the user typed elsewhere (the break's "Next block").
+
+        Not a prefill: Up next changes never replace it, and focusing the field puts the cursor
+        at the end (typing continues the text). Starting links it to an Up next task with the
+        same title, like any typed title; that task's project is shown.
+        """
+        title = title.strip()
+        self.task_field.set_error(None)
+        self._planned_task_id = None
+        self._prefill_title = None
+        self._draft_title = title
+        self._picked_title = None
+        self.task_field.set_text(title)
+        task = self._linked_task(title) if title else None
+        self.project_field.set_text((task.project or "") if task is not None else "")
+        self.set_minutes(minutes)
 
     def sync_prefill(self, task: PlannedTask | None) -> None:
         """Keep an untouched prefill in step with Up next (the item was done, moved or deleted)."""
@@ -598,21 +643,31 @@ class PlanCard(Card):
             return None
         task = self._linked_task(title)
         project = self.project() or (task.project if task is not None else None)
+        if project is None:
+            # Return on a completer row starts *before* the completer's ``activated`` fills the
+            # project (a mouse pick fills it first): apply the past task's project here too.
+            project = self._picked_project(title)
         sid = engine.start(title, self.minutes(), project, planned_task_id=task.id if task is not None else None)
         if sid is None:
             return None
         self._planned_task_id = None
         self._prefill_title = None
+        self._draft_title = None
+        self._picked_title = None
         self.task_field.set_error(None)
         self.task_field.set_text("")
         self.started.emit(sid)
         return sid
 
     def focus_task(self) -> None:
-        """Put keyboard focus in the task field (text selected)."""
+        """Put keyboard focus in the task field: a prefill is selected (typing replaces it), the
+        user's own draft (:meth:`set_draft`) gets the cursor at the end (typing continues it)."""
         edit = self.task_field.line_edit
         edit.setFocus(Qt.FocusReason.ShortcutFocusReason)
-        edit.selectAll()
+        if self._draft_title is not None and edit.text().strip() == self._draft_title:
+            edit.end(False)
+        else:
+            edit.selectAll()
 
     def close_popovers(self) -> None:
         """Dismiss any open popover (e.g. when the page switches state)."""
@@ -650,21 +705,14 @@ class _TaskRow(ListRow):
         self.task = task
         self._editor: TextField | None = None
         self._edit_done = False
-        name = _quote(task.title)
-        self.check = Checkbox(round=True, checked=task.done, accessible_name=f"Mark {name} done")
+        self.check = Checkbox(round=True, checked=task.done)
         self.check.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.add_leading(self.check)
         self.title = self.set_title(task.title, "body")
-        if task.done:
-            self.title.set_tone("muted")
-        self.title.setAccessibleName(task.title)
-        tip = task.title if not task.project else f"{task.title}\n{task.project}"
-        self.setToolTip(tip)
         self.minutes_badge = Badge(fmt_preset(task.minutes), "neutral", self, clickable=True)
         self.minutes_badge.setToolTip("Change length")
-        self.minutes_badge.setAccessibleName(f"{task.minutes} minutes — change length")
-        self.start_button = IconButton("play", "Start · Enter", 28, self, accessible_name=f"Start {name}", glyph=16)
-        self.more_button = IconButton("more", "More", 28, self, accessible_name=f"More actions for {name}", glyph=16)
+        self.start_button = IconButton("play", "Start · Enter", 28, self, glyph=16)
+        self.more_button = IconButton("more", "More", 28, self, glyph=16)
         for b in (self.start_button, self.more_button):
             b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         # ▶ / ⋯ appear on hover just left of the minutes badge, so the badges stay in one
@@ -673,9 +721,28 @@ class _TaskRow(ListRow):
         self.add_trailing(self.more_button, hover_only=True)
         self.trailing_layout.addSpacing(2)
         self.add_trailing(self.minutes_badge)
-        if task.done:
-            self.start_button.setEnabled(False)
         self._keyboard_cursor = False
+        self.set_task(task)
+
+    def set_task(self, task: PlannedTask) -> None:
+        """Show *task* (same id): the card updates rows in place instead of rebuilding them."""
+        self.task = task
+        name = _quote(task.title)
+        if self.check.isChecked() != bool(task.done):
+            self.check.setChecked(bool(task.done))
+        self.check.setAccessibleName(f"Mark {name} done")
+        if self.title.full_text() != task.title:
+            self.title.set_text(task.title)
+        if bool(self.title.property("tone")) != bool(task.done):  # re-polish only on change
+            self.title.set_tone("muted" if task.done else None)
+        self.title.setAccessibleName(task.title)
+        self.setToolTip(task.title if not task.project else f"{task.title}\n{task.project}")
+        if self.minutes_badge.text() != fmt_preset(task.minutes):
+            self.minutes_badge.set_text(fmt_preset(task.minutes))
+        self.minutes_badge.setAccessibleName(f"{task.minutes} minutes — change length")
+        self.start_button.setAccessibleName(f"Start {name}")
+        self.start_button.setEnabled(not task.done)
+        self.more_button.setAccessibleName(f"More actions for {name}")
 
     def set_keyboard_cursor(self, on: bool) -> None:
         """Outline the row as the list's keyboard cursor."""
@@ -793,14 +860,32 @@ class _TaskList(QWidget):
 
     # ------------------------------------------------------------------ rows
 
-    def set_rows(self, rows: list[_TaskRow]) -> None:
-        """Replace the rows (keeps the selection by task id when possible)."""
-        _clear_layout(self._layout)
+    def sync_rows(self, tasks: list[PlannedTask], make_row: Callable[[PlannedTask], _TaskRow]) -> None:
+        """Show *tasks* in order. Rows of known ids are updated in place, new ids get a row from
+        *make_row*, rows of vanished ids are deleted, and the layout is only rebuilt when the order
+        changed (a done toggle no longer re-creates every row). Keeps the selection by id."""
+        known = {row.task.id: row for row in self.rows}
+        rows: list[_TaskRow] = []
+        for task in tasks:
+            row = known.pop(task.id, None)
+            if row is None:
+                row = make_row(task)
+            else:
+                row.set_task(task)
+            rows.append(row)
+        for row in known.values():
+            self._layout.removeWidget(row)
+            row.hide()
+            row.deleteLater()
+        if not _same_widgets(rows, self.rows):
+            while self._layout.count():
+                self._layout.takeAt(0)
+            for row in rows:
+                if row.parentWidget() is not self:
+                    row.setParent(self)
+                self._layout.addWidget(row)
+                row.show()
         self.rows = rows
-        for row in rows:
-            row.setParent(self)
-            self._layout.addWidget(row)
-            row.show()
         ids = [r.task.id for r in rows]
         if self._selected_id not in ids:
             self._selected_id = None
@@ -834,10 +919,24 @@ class _TaskList(QWidget):
 
     def _sync_selection(self) -> None:
         show = self.hasFocus()
-        for row in self.rows:
+        selected = -1
+        for i, row in enumerate(self.rows):
             on = show and row.task.id == self._selected_id
             row.set_selected(on)
             row.set_keyboard_cursor(on and self._keyboard)
+            if on:
+                selected = i
+        # Focus stays on the list itself: describe the selected row so assistive tech announces
+        # each move (setAccessibleDescription sends QAccessible::DescriptionChanged).
+        self.setAccessibleDescription(self.selection_summary(selected))
+
+    def selection_summary(self, index: int) -> str:
+        """"Reply to reviewer, 25 min, 2 of 4" for row *index* ("" when none)."""
+        if not 0 <= index < len(self.rows):
+            return ""
+        task = self.rows[index].task
+        done = ", done" if task.done else ""
+        return f"{task.title}, {task.minutes} min{done}, {index + 1} of {len(self.rows)}"
 
     # ------------------------------------------------------------------ focus + keys
 
@@ -887,7 +986,8 @@ class _TaskList(QWidget):
         elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and plain and task_id is not None:
             card.start_task(task_id)
         elif key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and plain and task_id is not None:
-            card.delete_task(task_id)
+            if not event.isAutoRepeat():  # a held key deletes one task, not one per repeat
+                card.delete_task(task_id)
         elif key == Qt.Key.Key_F2 and plain and task_id is not None:
             card.begin_edit(task_id)
         elif (key == Qt.Key.Key_Menu or (key == Qt.Key.Key_F10 and mods == Qt.KeyboardModifier.ShiftModifier)) and task_id is not None:
@@ -983,8 +1083,7 @@ class UpNextCard(Card):
         undone = [t for t in all_tasks if not t.done]
         done = sorted((t for t in all_tasks if t.done), key=lambda t: (t.completed_at or t.created_at, t.id))
         self._tasks = undone + done
-        rows = [self._make_row(t) for t in self._tasks]
-        self.list.set_rows(rows)
+        self.list.sync_rows(self._tasks, self._make_row)
         n = len(undone)
         self.count_label.setText(str(n) if n else "")
         self.count_label.setVisible(n > 0)
@@ -1185,7 +1284,7 @@ class UpNextCard(Card):
         task = self._task(task_id)
         if row is None or task is None:
             return None
-        menu = Menu(self)
+        menu = Menu(self, delete_on_hide=True)
         menu.add_action("Edit", lambda: self.begin_edit(task_id), icon="edit", shortcut_text="F2")
         if not task.done:
             menu.add_action("Move to tomorrow", lambda: self.move_to_tomorrow(task_id), icon="calendar")
@@ -1274,7 +1373,8 @@ class TodayCard(Card):
     """Today's counted sessions (completed / ended early) with the day's total."""
 
     def __init__(self, ctx: AppContext, parent: QWidget | None = None) -> None:
-        super().__init__(padding=(20, 18, 20, 14), parent=parent)
+        # Top inset 24 like the Plan card beside it: the two headings share a baseline.
+        super().__init__(padding=(20, 24, 20, 14), parent=parent)
         self._ctx = ctx
         self._sessions: list[Session] = []
         self.body.setSpacing(6)
@@ -1341,20 +1441,28 @@ class _CaptureRow(ListRow):
     def __init__(self, cap: Any, parent: QWidget | None = None) -> None:
         super().__init__(40, parent, clickable=False, padding=(4, 4))
         self.capture = cap
-        name = _quote(cap.text)
-        self.check = Checkbox(round=True, accessible_name=f"Clear {name}")
+        self.check = Checkbox(round=True)
         self.check.setToolTip("Clear")
         self.add_leading(self.check)
         self.title = self.set_title(cap.text, "body")
-        self.setToolTip(cap.text)
         self.to_next = LinkButton("Up next", self, icon="arrow_right", size_px=12)
         self.to_next.setToolTip("Add to today's Up next")
-        self.to_next.setAccessibleName(f"Move {name} to Up next")
         self.add_trailing(self.to_next)
+        self.set_capture(cap)
         self.to_next.hide()
         self.hoveredChanged.connect(lambda _h: self._sync_action())
         for w in (self.check, self.to_next):
             w.installEventFilter(self)
+
+    def set_capture(self, cap: Any) -> None:
+        """Show *cap* (same id) — the card updates rows in place instead of rebuilding them."""
+        self.capture = cap
+        name = _quote(cap.text)
+        self.check.setAccessibleName(f"Clear {name}")
+        if self.title.full_text() != cap.text:
+            self.title.set_text(cap.text)
+        self.setToolTip(cap.text)
+        self.to_next.setAccessibleName(f"Move {name} to Up next")
 
     def _sync_action(self) -> None:
         fw = QApplication.focusWidget()
@@ -1401,11 +1509,32 @@ class ParkingLotCard(Card):
         return out
 
     def refresh(self) -> None:
-        """Re-read open captures (the card hides itself when there are none)."""
+        """Re-read open captures (the card hides itself when there are none).
+
+        Rows are kept per capture id (updated in place; created / deleted as captures come and
+        go) and the layout is only rebuilt when the order changed — clearing one of 100 open
+        captures no longer re-creates the other 99.
+        """
         self._captures = self._ctx.repo.open_captures()
-        _clear_layout(self._rows)
+        old = self.rows()
+        known = {row.capture.id: row for row in old}
+        rows: list[_CaptureRow] = []
         for cap in self._captures:
-            self._rows.addWidget(self._make_row(cap))
+            row = known.pop(cap.id, None)
+            if row is None:
+                row = self._make_row(cap)
+            else:
+                row.set_capture(cap)
+            rows.append(row)
+        for row in known.values():
+            self._rows.removeWidget(row)
+            row.hide()
+            row.deleteLater()
+        if not _same_widgets(rows, old):
+            while self._rows.count():
+                self._rows.takeAt(0)
+            for row in rows:
+                self._rows.addWidget(row)
         n = len(self._captures)
         self.count_label.setText(str(n))
         self.setVisible(n > 0)
@@ -1853,6 +1982,12 @@ class IdleView(PageScroll):
             self.mark_dirty(sections)
 
     def _on_day_changed(self) -> None:
+        if self._recap_dismissed:
+            # A new day may start a new ISO week (the app can stay in the tray for weeks): let
+            # should_show() decide again — weekly_recap_seen keeps a dismissed week hidden.
+            # (A visible card is left alone: re-asking would hide it, as it's marked seen.)
+            self._recap_dismissed = False
+            self._recap_visible = False
         self.mark_dirty(SECTIONS)
 
     def _on_setting_changed(self, key: str) -> None:
@@ -2035,7 +2170,7 @@ class IdleView(PageScroll):
 
     def snooze_menu(self) -> Menu:
         """The Snooze ▾ menu (15 min · 30 min · 1 hour · In a meeting…)."""
-        menu = Menu(self)
+        menu = Menu(self, delete_on_hide=True)
         menu.add_action("15 min", lambda: self._snooze(15), icon="bell_off")
         menu.add_action("30 min", lambda: self._snooze(30))
         menu.add_action("1 hour", lambda: self._snooze(60))
@@ -2056,13 +2191,20 @@ class IdleView(PageScroll):
 
     # ------------------------------------------------------------------ flows
 
-    def on_returned_to_idle(self) -> None:
-        """A session/break ended: prefill the plan card from Up next (else clear it)."""
+    def on_returned_to_idle(self, draft: tuple[str, int] | None = None) -> None:
+        """A session/break ended: prefill the plan card from Up next (else clear it).
+
+        *draft* — (title, minutes) the user typed into the break's "Next block" — is kept
+        instead (see :meth:`PlanCard.set_draft`).
+        """
         self.mark_dirty(("upnext", "plan", "header", "today"))
         if "upnext" in self._dirty:
             self.up_next.refresh()
             self._dirty.discard("upnext")
-        self.plan_card.prefill(self.up_next.first_unfinished())
+        if draft is not None:
+            self.plan_card.set_draft(*draft)
+        else:
+            self.plan_card.prefill(self.up_next.first_unfinished())
 
     def open_wrap_up(self) -> None:
         """Open the WrapUpSheet."""

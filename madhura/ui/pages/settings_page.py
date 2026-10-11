@@ -89,6 +89,9 @@ _SOUND_ROWS = (
     ("sound_nudge", "Nudges", "Gentle nudges stay silent unless this is on."),
 )
 _KEYBOARD_TEST_DELAY_MS = 450
+#: Theme/accent re-style every widget (~0.5 s): arrowing across the options applies only where
+#: the user stops (Enter/Space/focus-out apply at once).
+_RESTYLE_KEY_COMMIT_MS = 250
 _SELECT_MIN_WIDTH = 136
 _ACTION_MIN_WIDTH = 128
 _MENU_LIMIT = 8
@@ -109,6 +112,8 @@ def _schedule_relaunch(argv: list[str]) -> Callable[[], None]:
         try:
             from PySide6.QtCore import QProcess
 
+            # The detached process inherits os.environ: a frozen build must start as a fresh instance.
+            autostart.prepare_relaunch_environment(os.environ)
             result = QProcess.startDetached(argv[0], argv[1:], cwd)
             ok = result[0] if isinstance(result, tuple) else result
             if not ok:
@@ -320,7 +325,7 @@ class SettingsPage(PageScroll):
 
     def _build_checkins(self) -> None:
         g = self._group("Check-ins")
-        self._toggle(g, "checkin_enabled", "Check-ins", "A quiet “Still on it?” while you focus. Only you see the answers.")
+        self._toggle(g, "checkin_enabled", "Ask during sessions", "A quiet “Still on it?” while you focus. Only you see the answers.")
         self._select(g, "checkin_interval_minutes", "Interval", "Counted in focused minutes.", _INTERVAL_OPTIONS)
         self._toggle(g, "checkin_adaptive", "Adaptive spacing", "Space them out when you're consistently focused.")
         self._select(
@@ -335,7 +340,7 @@ class SettingsPage(PageScroll):
 
     def _build_breaks(self) -> None:
         g = self._group("Breaks")
-        self._toggle(g, "breaks_enabled", "Breaks", "Offer a short break when a session ends.")
+        self._toggle(g, "breaks_enabled", "Offer breaks", "A short break when a session ends.")
         self._int_stepper(g, "break_minutes", "Break length", None, 1, 30, " min")
         self._toggle(g, "auto_start_break", "Start breaks automatically", "Begin the break as soon as a session completes.")
 
@@ -458,7 +463,9 @@ class SettingsPage(PageScroll):
     def _build_appearance(self) -> None:
         g = self._group("Appearance")
         self._segmented(g, "theme", "Theme", None, [("system", "System"), ("dark", "Dark"), ("light", "Light")])
+        self.controls["theme"].set_key_commit_delay(_RESTYLE_KEY_COMMIT_MS)
         self.accent_picker = AccentPicker(self._get("accent"))
+        self.accent_picker.set_key_commit_delay(_RESTYLE_KEY_COMMIT_MS)
         self.accent_picker.valueChanged.connect(lambda name: self._set("accent", name))
         self._syncers["accent"] = lambda: self.accent_picker.set_value(self._get("accent"))
         self._row(g, "accent", "Accent color", None, self.accent_picker)

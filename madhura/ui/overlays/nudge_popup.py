@@ -271,7 +271,7 @@ class NudgePopup(FloatingPanel):
 
     def snooze_menu(self) -> Menu:
         """Build the Snooze ▾ menu (15 min · 30 min · 1 hour · In a meeting… ▸ 30 min / 1 hour)."""
-        menu = Menu(self)
+        menu = Menu(self, delete_on_hide=True)
         menu.add_action("15 min", lambda: self.snooze(15), icon="bell_off")
         menu.add_action("30 min", lambda: self.snooze(30))
         menu.add_action("1 hour", lambda: self.snooze(60))

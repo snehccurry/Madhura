@@ -375,10 +375,11 @@ def _scheduled(habit: Any, d: date) -> bool:
     return bool(int(getattr(habit, "days", 0) or 0) & 0b1111111 & (1 << d.weekday()))
 
 
-def _created(habit: Any) -> date | None:
+def _created(habit: Any, day_start_hour: int = 0) -> date | None:
+    """Logical date *habit* was created (see ``core.habits.created_date``)."""
     created = getattr(habit, "created_at", None)
     if isinstance(created, datetime):
-        return created.date()
+        return logical_date(created, day_start_hour)
     return created if isinstance(created, date) else None
 
 
@@ -389,12 +390,14 @@ def habit_completion_counts(
     end_d: date,
     *,
     today: date | None = None,
+    day_start_hour: int = 0,
 ) -> tuple[int, int]:
     """``(done, scheduled)`` habit-days in ``[start_d, end_d]``.
 
-    Only scheduled days on/after a habit's creation count; 'skipped' days are neutral (left out
-    of both numbers); archived habits are ignored. *today* (and later dates) only count once a
-    habit is done — an unfinished today never lowers the rate.
+    Only scheduled days on/after a habit's creation (its logical date for *day_start_hour*)
+    count; 'skipped' days are neutral (left out of both numbers); archived habits are ignored.
+    *today* (and later dates) only count once a habit is done — an unfinished today never lowers
+    the rate.
     """
     status: dict[tuple[int, date], str] = {}
     for log in logs:
@@ -403,7 +406,7 @@ def habit_completion_counts(
     for h in habits:
         if getattr(h, "archived", False):
             continue
-        created = _created(h)
+        created = _created(h, day_start_hour)
         first = max(start_d, created) if created is not None else start_d
         for d in date_range(first, end_d):
             if not _scheduled(h, d):
@@ -426,10 +429,11 @@ def habit_completion(
     end_d: date,
     *,
     today: date | None = None,
+    day_start_hour: int = 0,
 ) -> float | None:
     """Done / scheduled habit-days in the range (see :func:`habit_completion_counts`); None when
     nothing was scheduled."""
-    done, scheduled = habit_completion_counts(habits, logs, start_d, end_d, today=today)
+    done, scheduled = habit_completion_counts(habits, logs, start_d, end_d, today=today, day_start_hour=day_start_hour)
     return done / scheduled if scheduled else None
 
 

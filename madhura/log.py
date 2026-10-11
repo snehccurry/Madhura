@@ -14,7 +14,7 @@ from typing import IO
 
 from madhura import paths
 
-__all__ = ["setup_logging", "install_excepthook", "LOG_FORMAT"]
+__all__ = ["setup_logging", "install_excepthook", "warn_once", "LOG_FORMAT"]
 
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 _HANDLER_TAG = "_madhura_handler"
@@ -70,6 +70,21 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
         except (OSError, RuntimeError, ValueError):
             _State.crash_file = None
     return root
+
+
+def warn_once(logger: logging.Logger, seen: set[str], key: str, message: str, *args: object) -> None:
+    """Log *message* with the active exception at WARNING the first time *key* fails, DEBUG after.
+
+    For probes that fail the same way on every poll (idle time, OS attention state, sound playback):
+    the first failure must reach madhura.log (INFO) so a feature that silently switched itself off
+    can be diagnosed, while repeats must not flood it. *seen* holds the keys already warned about
+    (module-level for module functions, per instance for objects). Never raises.
+    """
+    if key in seen:
+        logger.debug(message, *args, exc_info=True)
+        return
+    seen.add(key)
+    logger.warning(message, *args, exc_info=True)
 
 
 def _format_exc(exc_type: type[BaseException], exc: BaseException, tb: TracebackType | None) -> str:

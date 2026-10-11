@@ -3,15 +3,20 @@
 The icon is drawn programmatically: an accent ring (idle) or a depleting progress arc while a
 session or break runs. It is only regenerated when the arc moves by at least 1/24 turn, the state
 changes or the theme changes. The tooltip is refreshed at most every 15 s while ticking.
+
+Its colours follow the taskbar, not the app: on Windows the notification area has its own light /
+dark mode (``SystemUsesLightTheme``), so a dark-themed Madhura on the default light Windows 11
+taskbar draws the light palette's (darker) accent / break / muted colours, and vice versa.
 """
 
 from __future__ import annotations
 
 import logging
+import sys
 from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QElapsedTimer, QObject, QRectF, Qt
-from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QColor, QGuiApplication, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QSystemTrayIcon
 
 from madhura.core.timefmt import fmt_time
@@ -24,7 +29,7 @@ if TYPE_CHECKING:
 
     from madhura.context import AppContext
 
-__all__ = ["Tray", "render_tray_pixmap", "tray_icon_for", "tray_tooltip", "ICON_SIZES"]
+__all__ = ["Tray", "render_tray_pixmap", "tray_icon_for", "tray_tooltip", "tray_palette", "taskbar_is_light", "ICON_SIZES"]
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +38,36 @@ ARC_STEPS = 24
 TOOLTIP_INTERVAL_MS = 15_000
 TOGGLE_MEMORY_MS = 400
 _TASK_TOOLTIP_CHARS = 60
+TASKBAR_CHECK_MS = 10_000  # re-read the taskbar mode at most this often (while ticking)
+_PERSONALIZE_KEY = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+
+
+def taskbar_is_light() -> bool | None:
+    """Windows: True when the taskbar / notification area is light (``SystemUsesLightTheme`` = 1 —
+    not ``AppsUseLightTheme``, which is the app mode), False when dark. None elsewhere, or when
+    the value is missing (Windows 10 before 1903: the taskbar is always dark there)."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _PERSONALIZE_KEY) as key:
+            value, _kind = winreg.QueryValueEx(key, "SystemUsesLightTheme")
+    except (ImportError, OSError):
+        return None
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def tray_palette(palette: theme.Palette | None = None, light_taskbar: bool | None = None) -> theme.Palette:
+    """The palette to draw the tray glyph with: the app's, or — when the taskbar's light/dark mode
+    is known and differs from the app's — the same accent in the taskbar's scheme."""
+    pal = palette or theme.palette()
+    if light_taskbar is None or light_taskbar != pal.is_dark:
+        return pal
+    return theme.build_palette("light" if light_taskbar else "dark", pal.accent_name)
 
 
 def _elide(text: str, limit: int) -> str:
@@ -115,6 +150,9 @@ class Tray(QObject):
         self._icon_key: tuple[Any, ...] | None = None
         self._tooltip_clock = QElapsedTimer()
         self._last_state: str | None = None
+        self._taskbar_light = taskbar_is_light()
+        self._taskbar_clock = QElapsedTimer()
+        self._taskbar_clock.start()
         self._actions: dict[str, QAction] = {}
         self._build_menu()
         self.tray_icon.setContextMenu(self.menu)
@@ -123,6 +161,9 @@ class Tray(QObject):
         engine.tick.connect(self._on_tick)
         engine.state_changed.connect(self._on_state_changed)
         ctx.theme.changed.connect(self._on_theme)
+        hints = QGuiApplication.styleHints()
+        if hasattr(hints, "colorSchemeChanged"):  # the OS switched light/dark (taskbar included)
+            hints.colorSchemeChanged.connect(self._on_system_scheme)
         self.refresh(force_tooltip=True)
 
     # ------------------------------------------------------------------ visibility
@@ -158,10 +199,21 @@ class Tray(QObject):
         self._icon_key = None
         self.refresh(force_tooltip=False)
 
+    def _on_system_scheme(self, *_args: object) -> None:
+        self._check_taskbar(force=True)
+        self.refresh(force_tooltip=False)
+
+    def _check_taskbar(self, force: bool = False) -> None:
+        if force or self._taskbar_clock.elapsed() >= TASKBAR_CHECK_MS:
+            self._taskbar_clock.restart()
+            self._taskbar_light = taskbar_is_light()
+
     def refresh(self, force_tooltip: bool = False) -> None:
-        """Redraw the icon if the arc moved ≥ 1/24 turn (or state/theme changed); tooltip ≤ every 15 s."""
+        """Redraw the icon if the arc moved ≥ 1/24 turn (or state/theme/taskbar mode changed);
+        tooltip ≤ every 15 s."""
         state, fraction = self._state_fraction()
-        pal = theme.palette()
+        self._check_taskbar()
+        pal = tray_palette(theme.palette(), self._taskbar_light)
         bucket = int(round(max(0.0, min(1.0, fraction)) * ARC_STEPS))
         key = (state, bucket, pal.accent, pal.break_, pal.text_muted)
         if key != self._icon_key:
@@ -222,6 +274,8 @@ class Tray(QObject):
 
     def refresh_menu(self) -> None:
         """Sync labels / enabled states with the engine, pill, attention and nudges (aboutToShow)."""
+        self._check_taskbar(force=True)
+        self.refresh(force_tooltip=False)
         ctx = self._ctx
         e = ctx.engine
         state = str(e.state)

@@ -7,16 +7,18 @@ No function in this module ever raises.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from typing import TYPE_CHECKING, Any
 
-from madhura import APP_ID
+from madhura import APP_ID, APP_NAME
 
 if TYPE_CHECKING:
     from PySide6.QtWidgets import QWidget
 
 __all__ = [
     "set_app_user_model_id",
+    "register_app_user_model_id",
     "set_caption_colors",
     "set_round_corners",
     "set_dark_title_bar",
@@ -50,6 +52,13 @@ SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOACTIVATE = 0x0010
 SWP_SHOWWINDOW = 0x0040
+
+# ShowWindow
+SW_SHOWNOACTIVATE = 4
+
+#: QWindow property Qt's platform plugins read on show: Windows uses SW_SHOWNOACTIVATE, xcb skips
+#: the focus-stealing user time, Cocoa orders front without making the window key.
+_NO_ACTIVATE_PROP = "_q_showWithoutActivating"
 
 SPI_GETCLIENTAREAANIMATION = 0x1042
 FLASHW_TRAY = 0x00000002
@@ -115,6 +124,39 @@ def set_app_user_model_id(app_id: str = APP_ID) -> bool:
         return ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(str(app_id)) == 0
     except Exception:  # noqa: BLE001
         log.debug("SetCurrentProcessExplicitAppUserModelID failed", exc_info=True)
+        return False
+
+
+def register_app_user_model_id(
+    app_id: str = APP_ID, display_name: str = APP_NAME, icon_path: str | os.PathLike[str] | None = None
+) -> bool:
+    """Give the explicit AUMID a name (and icon) for notifications and Settings › Notifications.
+
+    Without a Start-menu shortcut carrying the AUMID (the portable build has none), Windows looks
+    it up under ``HKCU\\Software\\Classes\\AppUserModelId\\<id>``; unregistered, toasts show the raw
+    ID. Writes only values that differ. Best effort: returns False on other OS or failure.
+    """
+    if not _IS_WINDOWS:
+        return False
+    try:
+        import winreg
+
+        values = {"DisplayName": str(display_name)}
+        if icon_path is not None and os.path.isfile(icon_path):
+            values["IconUri"] = os.path.abspath(icon_path)
+        key_path = f"Software\\Classes\\AppUserModelId\\{app_id}"
+        access = winreg.KEY_READ | winreg.KEY_WRITE
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, key_path, 0, access) as key:
+            for name, value in values.items():
+                try:
+                    current = winreg.QueryValueEx(key, name)
+                except OSError:
+                    current = None
+                if current is None or current[0] != value:
+                    winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
+        return True
+    except Exception:  # noqa: BLE001 - cosmetic; never block startup
+        log.warning("Could not register the AppUserModelID %s", app_id, exc_info=True)
         return False
 
 
@@ -228,18 +270,91 @@ def flash(widget: QWidget) -> bool:
     return True
 
 
+def _show_no_activate_native(widget: QWidget) -> bool:
+    """Windows: restore a minimized window with ShowWindow(SW_SHOWNOACTIVATE) (Qt syncs its state
+    from the resulting WM_SIZE). Only for windows that were not maximized: SW_SHOWNOACTIVATE
+    restores to the normal rect."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        hwnd = _hwnd(widget)
+        if hwnd is None:
+            return False
+        user32 = ctypes.windll.user32
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.ShowWindow.restype = wintypes.BOOL
+        user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+        return True
+    except Exception:  # noqa: BLE001
+        log.debug("ShowWindow(SW_SHOWNOACTIVATE) failed", exc_info=True)
+        return False
+
+
+def _show_without_activating(widget: QWidget) -> None:
+    """``widget.show()`` with Qt's no-activate window property set just for this call.
+
+    Not via WA_ShowWithoutActivating: Qt copies that to the property and never clears it, so a
+    later show_main(activate=True) would come up inactive too.
+    """
+    window = widget.windowHandle()
+    if window is None:
+        widget.winId()  # create the native window so the property can be set before showing
+        window = widget.windowHandle()
+    if window is None:
+        widget.show()
+        return
+    previous = window.property(_NO_ACTIVATE_PROP)
+    window.setProperty(_NO_ACTIVATE_PROP, True)
+    try:
+        widget.show()
+    finally:
+        window.setProperty(_NO_ACTIVATE_PROP, previous)
+
+
+def _restore_and_show(widget: QWidget, steal_focus: bool) -> None:
+    """Un-minimize (keeping a maximized window maximized) and show *widget*; unless *steal_focus*,
+    without activating it where the platform allows."""
+    from PySide6.QtCore import Qt
+
+    state = widget.windowState()
+    maximized = bool(state & (Qt.WindowState.WindowMaximized | Qt.WindowState.WindowFullScreen))
+    if widget.isMinimized():
+        native = _IS_WINDOWS and not steal_focus and not maximized and widget.isVisible()
+        if not (native and _show_no_activate_native(widget)):
+            # Clear only the minimized bit: showNormal() would also drop Maximized.
+            widget.setWindowState(state & ~Qt.WindowState.WindowMinimized)
+    if widget.isVisible():
+        return
+    if steal_focus or (_IS_WINDOWS and maximized):
+        # Windows maps "show without activating" to SW_SHOWNOACTIVATE, which would also restore
+        # a maximized window to its normal size.
+        widget.show()
+    else:
+        _show_without_activating(widget)
+
+
+def _release_topmost(widget: QWidget) -> None:
+    """Drop HWND_TOPMOST again (z-order only: SWP_SHOWWINDOW here would re-show a window the user
+    hid meanwhile behind Qt's back). Also runs for a hidden window, which would otherwise stay
+    always-on-top the next time it is shown."""
+    try:
+        hwnd = _hwnd(widget)
+        if hwnd is not None:
+            _set_window_pos(hwnd, HWND_NOTOPMOST, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+    except Exception:  # noqa: BLE001
+        log.debug("bring_to_front: NOTOPMOST failed", exc_info=True)
+
+
 def bring_to_front(widget: QWidget, steal_focus: bool = False) -> None:
     """Show *widget* above other windows without stealing keyboard focus (unless *steal_focus*).
 
-    Windows: showNormal if minimized, show, SetWindowPos TOPMOST (no activate) then NOTOPMOST
-    after 1.5 s, plus a taskbar alert. Elsewhere: show/raise_/alert. Never touches
-    WindowStaysOnTopHint.
+    Un-minimizes (a maximized window stays maximized) and shows without activation. Windows:
+    then SetWindowPos TOPMOST (no activate) and NOTOPMOST after 1.5 s, plus a taskbar alert.
+    Elsewhere: show/raise_/alert. Never touches WindowStaysOnTopHint.
     """
     try:
-        if widget.isMinimized():
-            widget.showNormal()
-        else:
-            widget.show()
+        _restore_and_show(widget, steal_focus)
     except Exception:  # noqa: BLE001
         log.debug("bring_to_front: show failed", exc_info=True)
         return
@@ -251,15 +366,10 @@ def bring_to_front(widget: QWidget, steal_focus: bool = False) -> None:
                 flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
                 _set_window_pos(hwnd, HWND_TOPMOST, flags)
 
-                def _release() -> None:
-                    try:
-                        _set_window_pos(hwnd, HWND_NOTOPMOST, flags)
-                    except Exception:  # noqa: BLE001
-                        log.debug("bring_to_front: NOTOPMOST failed", exc_info=True)
-
                 from PySide6.QtCore import QTimer
 
-                QTimer.singleShot(_TOPMOST_RELEASE_MS, _release)
+                # widget as context: no callback into a deleted window.
+                QTimer.singleShot(_TOPMOST_RELEASE_MS, widget, lambda: _release_topmost(widget))
         except Exception:  # noqa: BLE001
             log.debug("bring_to_front: SetWindowPos failed", exc_info=True)
     else:

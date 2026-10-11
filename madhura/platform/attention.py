@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import sys
 
+from madhura.log import warn_once
+
 __all__ = ["system_attention", "attention_from_quns", "AVAILABLE", "BUSY", "AWAY"]
 
 log = logging.getLogger(__name__)
@@ -12,6 +14,9 @@ log = logging.getLogger(__name__)
 AVAILABLE = "available"
 BUSY = "busy"
 AWAY = "away"
+
+#: Failures already logged at WARNING (repeats go to DEBUG; see :func:`madhura.log.warn_once`).
+_WARNED: set[str] = set()
 
 # QUERY_USER_NOTIFICATION_STATE values (shellapi.h)
 QUNS_NOT_PRESENT = 1  # screen saver, locked, fast user switching
@@ -48,8 +53,8 @@ def system_attention() -> str:
         state = ctypes.c_int(0)
         hr = ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(state))
         if hr != 0:
-            return AVAILABLE
+            raise OSError(f"SHQueryUserNotificationState returned 0x{int(hr) & 0xFFFFFFFF:08X}")
         return attention_from_quns(state.value)
     except Exception:  # noqa: BLE001 - platform probing must never raise
-        log.debug("SHQueryUserNotificationState failed", exc_info=True)
+        warn_once(log, _WARNED, "quns", "SHQueryUserNotificationState failed; presentation/fullscreen detection is off")
         return AVAILABLE

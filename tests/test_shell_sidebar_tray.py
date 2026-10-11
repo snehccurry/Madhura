@@ -172,6 +172,40 @@ def test_tray_icon_redraws_per_24th_turn(shell: AppContext) -> None:  # noqa: F8
         tray.hide()
 
 
+def test_tray_colours_follow_the_taskbar(shell: AppContext, monkeypatch) -> None:  # noqa: F811, ANN001
+    """Windows 11's default taskbar is light while Madhura defaults to dark: the glyph must use
+    the light palette's (darker) colours there — the dark ones are below 3:1 on #EEEEEE."""
+    import sys
+
+    from madhura.ui import theme, tray as tray_mod
+
+    if sys.platform != "win32":
+        assert tray_mod.taskbar_is_light() is None  # other OSes keep the app palette
+    app_pal = theme.palette()
+    assert app_pal.is_dark
+    assert tray_mod.tray_palette(app_pal, None) is app_pal
+    assert tray_mod.tray_palette(app_pal, False) is app_pal
+    light = tray_mod.tray_palette(app_pal, True)
+    assert not light.is_dark and light.accent_name == app_pal.accent_name and light.accent != app_pal.accent
+
+    taskbar: dict[str, bool | None] = {"light": True}
+    monkeypatch.setattr(tray_mod, "taskbar_is_light", lambda: taskbar["light"])
+    tray = Tray(shell)
+    try:
+        assert tray.icon_key()[2] == light.accent  # type: ignore[index]
+        shell.engine.start("Write", 25)
+        shell.engine.pause()
+        assert tray.icon_key()[0] == "paused" and tray.icon_key()[4] == light.text_muted  # type: ignore[index]
+        taskbar["light"] = False  # the user switched Windows to dark mode
+        tray._on_system_scheme()  # noqa: SLF001 - QStyleHints.colorSchemeChanged
+        assert tray.icon_key()[2] == app_pal.accent and tray.icon_key()[4] == app_pal.text_muted  # type: ignore[index]
+        taskbar["light"] = True
+        tray.refresh_menu()  # opening the menu re-reads the taskbar mode too
+        assert tray.icon_key()[2] == light.accent  # type: ignore[index]
+    finally:
+        tray.hide()
+
+
 def test_tray_tooltip_throttled(shell: AppContext) -> None:  # noqa: F811
     tray = Tray(shell)
     try:
@@ -310,3 +344,25 @@ def test_shortcuts_sheet_lists_every_global_shortcut(qapp: QApplication) -> None
     assert sheet.title_text() == "Keyboard shortcuts"
     assert sheet.primary_button() is not None
     assert display_keys("Ctrl+N") in ("Ctrl+N", "⌘+N")
+
+
+def test_shortcuts_sheet_lists_the_page_keys(shell: AppContext) -> None:  # noqa: F811
+    """The list keys of Up next / Habits / Insights are discoverable too, and the sheet still fits
+    the default window without scrolling."""
+    groups = dict(SHORTCUT_GROUPS)
+    assert {"General", "Focus session", "Up next", "Habits", "Insights"} <= set(groups)
+    up_next = {k for _t, k in groups["Up next"]}
+    assert {"↑+↓", "Space", "Enter", "Alt+↑+↓", "F2", "Del"} <= up_next
+    habits = {k for _t, k in groups["Habits"]}
+    assert {"↑+↓", "Space", "S", "E", "Del"} <= habits
+    assert "Del" in {k for _t, k in groups["Insights"]}
+    win = shell.window
+    win.resize(1120, 760)  # type: ignore[union-attr]
+    win.show_main()  # type: ignore[union-attr]
+    win.show_shortcuts()  # type: ignore[union-attr]
+    QApplication.processEvents()
+    sheet = win.sheet_host.current()  # type: ignore[union-attr]
+    assert isinstance(sheet, ShortcutsSheet)
+    assert not sheet.footer_pinned()  # fits: no scrolling body
+    kbd_widths = [row.kbd.sizeHint().width() for row in sheet.rows]
+    assert all(row.kbd.width() >= w for row, w in zip(sheet.rows, kbd_widths))  # no squeezed key caps

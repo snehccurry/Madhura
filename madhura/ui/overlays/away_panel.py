@@ -1,12 +1,14 @@
 """AwayPanel — offer to remove idle time from the running session (spec §1.5, §7.3).
 
-"Away for 14 min" + [Keep as focus] [Remove 14 min]. Removing calls
-``engine.discard_focused(seconds)`` (honest data); no answer within 60 s keeps the time. Hovering
+"Away for 14 min" + [Keep as focus] [Remove 14 min]. Removing calls the *remover* (default
+``engine.discard_focused(seconds)``; the AwayService passes one bound to the session, so the panel
+can still correct it after it ended) — honest data; no answer within 60 s keeps the time. Hovering
 pauses the countdown. Shown by :class:`madhura.services.away_service.AwayService`.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -48,18 +50,26 @@ class AwayPanel(FloatingPanel):
     """Non-activating "Away for N min" panel (popup stack priority 2).
 
     Emits ``decided(str)`` once: "remove" (after discarding the time), "keep" (button or the 60 s
-    timeout) or "cancel" (closed because the session ended).
+    timeout) or "cancel" (closed because the session was abandoned or replaced).
     """
 
     decided = Signal(str)
 
-    def __init__(self, ctx: AppContext | None = None, seconds: float = 0.0, *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        ctx: AppContext | None = None,
+        seconds: float = 0.0,
+        *args: Any,
+        remover: Callable[[float], float] | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__("away")
         install_focus_guard()
         self.priority = PRIORITIES["away"]
         self._ctx = ctx
         self._seconds = max(0.0, float(seconds))
         self._decision: str | None = None
+        self._remover = remover
         self.setAccessibleName("Away from your session")
 
         self.page = QWidget()
@@ -136,11 +146,13 @@ class AwayPanel(FloatingPanel):
         self.dismiss()
 
     def remove(self) -> None:
-        """Discard the away time from the running session, confirm briefly, then close."""
+        """Discard the away time from the session, confirm briefly, then close."""
         if self._decision is not None:
             return
         removed = 0.0
-        if self._ctx is not None:
+        if self._remover is not None:
+            removed = float(self._remover(self._seconds))
+        elif self._ctx is not None:
             removed = float(self._ctx.engine.discard_focused(self._seconds))
         self._decide("remove")
         if removed <= 0:
@@ -149,7 +161,7 @@ class AwayPanel(FloatingPanel):
         self._show_confirmation(removed)
 
     def cancel(self) -> None:
-        """Close without acting (the session ended)."""
+        """Close without acting (the session was abandoned or a new one started)."""
         if self._decision is None:
             self._decide("cancel")
         self.dismiss()

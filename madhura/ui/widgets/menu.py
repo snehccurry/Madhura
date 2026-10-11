@@ -51,10 +51,19 @@ def round_window_corners(widget: QWidget, small: bool = False) -> bool:
 
 class Menu(QMenu):
     """Styled popup menu. Build it with :meth:`add_action` / :meth:`add_separator` /
-    :meth:`add_menu`; show it with :meth:`popup_below` or ``popup(pos)``."""
+    :meth:`add_menu`; show it with :meth:`popup_below` or ``popup(pos)``.
 
-    def __init__(self, parent: QWidget | None = None, title: str = "") -> None:
+    ``delete_on_hide=True`` is for one-shot menus built per click: the menu (a native top-level
+    window while shown) is deleted once it closes instead of piling up under its long-lived
+    parent. QMenu hides before it triggers the chosen action, and the deferred delete only runs
+    when control returns to the event loop, so the action's callback (even one that runs a modal
+    loop) still sees a live menu. Keep the default for a persistent menu (the tray's).
+    """
+
+    def __init__(self, parent: QWidget | None = None, title: str = "", *, delete_on_hide: bool = False) -> None:
         super().__init__(title, parent)
+        if delete_on_hide:
+            self.aboutToHide.connect(self.deleteLater)
         self._native_round = is_windows_11()
         self._min_width = 0
         if self._native_round:

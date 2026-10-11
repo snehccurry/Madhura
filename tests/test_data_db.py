@@ -150,3 +150,114 @@ def test_checkpoint_and_close_truncates_wal(tmp_path: Path) -> None:
     wal = tmp_path / "madhura.db-wal"
     assert not wal.exists() or wal.stat().st_size == 0
     assert repo.closed
+
+
+# --------------------------------------------------------------------------- locked ≠ corrupt
+
+
+def _no_corrupt_files(folder: Path) -> bool:
+    return not [p for p in folder.iterdir() if ".corrupt-" in p.name]
+
+
+def test_locked_database_is_not_quarantined(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Another program holding an exclusive lock must not make a healthy DB look damaged."""
+    path = tmp_path / "madhura.db"
+    repo = Repository(path)
+    repo.add_habit("keep me")
+    repo.close()
+    blocker = sqlite3.connect(path, isolation_level=None)
+    blocker.execute("PRAGMA locking_mode=EXCLUSIVE")
+    blocker.execute("BEGIN EXCLUSIVE")
+    real_connect = sqlite3.connect
+    monkeypatch.setattr(dbmod.sqlite3, "connect", lambda *a, **kw: real_connect(*a, **{**kw, "timeout": 0.05}))
+    sleeps: list[float] = []
+    monkeypatch.setattr(dbmod.time, "sleep", sleeps.append)
+    try:
+        with pytest.raises(dbmod.DatabaseUnavailable) as info:
+            Repository(path)
+        assert info.value.path == path and dbmod.is_unavailable_error(info.value.reason)
+        assert sleeps == []  # SQLite's busy handler already waited; no extra retries
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+    assert _no_corrupt_files(tmp_path)
+    repo = Repository(path)
+    try:
+        assert repo.recovered_from is None
+        assert [h.name for h in repo.habits()] == ["keep me"]
+    finally:
+        repo.close()
+
+
+def test_transient_open_errors_are_retried(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "madhura.db"
+    Repository(path).close()
+    real = dbmod._open_checked
+    calls: list[Path] = []
+    fail_times = [2]
+
+    def flaky(p: Path) -> sqlite3.Connection:
+        calls.append(p)
+        if len(calls) <= fail_times[0]:
+            # Built by hand → no sqlite_errorcode, like Python 3.10: matched by message.
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(p)
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(dbmod, "_open_checked", flaky)
+    monkeypatch.setattr(dbmod.time, "sleep", sleeps.append)
+    conn, moved = dbmod.open_database(path)
+    conn.close()
+    assert moved is None and len(calls) == 3 and sleeps == list(dbmod.OPEN_RETRY_DELAYS_S)
+
+    # Still failing after the retries → DatabaseUnavailable, nothing renamed or created.
+    calls.clear()
+    fail_times[0] = 99
+    with pytest.raises(dbmod.DatabaseUnavailable):
+        dbmod.open_database(path)
+    assert len(calls) == len(dbmod.OPEN_RETRY_DELAYS_S) + 1
+    assert path.exists() and _no_corrupt_files(tmp_path)
+
+
+def test_quarantine_failure_is_unavailable_not_a_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows: the damaged file can't be renamed while another process has it open."""
+    path = tmp_path / "madhura.db"
+    path.write_bytes(b"this is definitely not a sqlite database" * 100)
+
+    def sharing_violation(src: object, dst: object) -> None:
+        raise PermissionError(32, "The process cannot access the file")
+
+    monkeypatch.setattr(dbmod.os, "replace", sharing_violation)
+    with pytest.raises(dbmod.DatabaseUnavailable) as info:
+        dbmod.open_database(path)
+    assert isinstance(info.value.reason, PermissionError)
+    assert path.read_bytes().startswith(b"this is definitely")
+
+
+def test_foreign_schema_is_still_quarantined(tmp_path: Path) -> None:
+    """SQLITE_ERROR (e.g. a migration hitting someone else's 'sessions' table) is not 'unavailable'."""
+    path = tmp_path / "madhura.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE sessions(x)")
+    conn.close()
+    conn, moved = dbmod.open_database(path, FakeClock(datetime(2026, 1, 1)))
+    try:
+        assert moved is not None and moved.exists()
+        assert TABLES <= table_names(conn)
+    finally:
+        conn.close()
+
+
+def test_quick_check_raises_when_locked_but_not_when_damaged() -> None:
+    class Conn:
+        def __init__(self, exc: Exception) -> None:
+            self.exc = exc
+
+        def execute(self, _sql: str) -> object:
+            raise self.exc
+
+    assert dbmod.quick_check(Conn(sqlite3.DatabaseError("file is not a database"))) is False  # type: ignore[arg-type]
+    with pytest.raises(sqlite3.OperationalError):
+        dbmod.quick_check(Conn(sqlite3.OperationalError("database is locked")))  # type: ignore[arg-type]
+    assert not dbmod.is_unavailable_error(sqlite3.OperationalError("no such column: started_at"))
+    assert not dbmod.is_unavailable_error(sqlite3.DatabaseError("database disk image is malformed"))

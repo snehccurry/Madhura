@@ -50,6 +50,8 @@ from PySide6.QtWidgets import (
 from madhura.core.checkins import MIN_REMAINING_SECONDS
 from madhura.core.timefmt import fmt_clock, fmt_preset, fmt_time
 from madhura.ui import animations, dialogs, fonts, theme
+from madhura.ui.overlays.checkin_popup import confirmation_text
+from madhura.ui.shortcuts_sheet import display_keys
 from madhura.ui.widgets._common import fill_rounded
 from madhura.ui.widgets.buttons import Button, IconButton
 from madhura.ui.widgets.chips import Chip
@@ -651,13 +653,10 @@ class CheckInStrip(QWidget):
             ck.answer(response, reason)
         self.reload_counts()
         if response == "focused":
-            secs = None
-            if ck is not None:
-                secs = ck.seconds_until_next()
-            if secs is not None and secs > 0:
-                text = f"✓ Nice — next check-in in ~{max(1, int(math.ceil(secs / 60.0 - 1e-9)))} min"
-            else:
-                text = "✓ Nice — keep going"
+            secs = ck.seconds_until_next() if ck is not None else None
+            # Same rule as the popup and the status line: only announce a check-in that can
+            # still fire before the block ends.
+            text = "✓ " + confirmation_text("focused", task, secs, self._ctx.engine.remaining_seconds)
             self.confirm_label.set_tone("success")
         else:
             fm = QFontMetrics(self.confirm_label.font())
@@ -709,6 +708,7 @@ class ActiveView(QWidget):
         self._a11y_key: tuple[Any, ...] | None = None
         self._next_task: PlannedTask | None = None
         self._next_edited = False
+        self._break_draft: tuple[str, int] | None = None
         self.setObjectName("mhActiveView")
 
         outer = QVBoxLayout(self)
@@ -835,8 +835,8 @@ class ActiveView(QWidget):
         self.extend_button = Button(f"+{EXTEND_MINUTES} min", "secondary", size="lg", parent=self.controls)
         self.extend_button.setToolTip(f"Add {EXTEND_MINUTES} minutes")
         self.finish_button = Button("Finish", "secondary", icon="check", size="lg", parent=self.controls)
-        self.finish_button.setToolTip("Finish · Ctrl+Shift+F")
-        self.hide_button = IconButton("eye_off", "Hide to mini timer · Ctrl+H", 40, self.controls)
+        self.finish_button.setToolTip(f"Finish · {display_keys('Ctrl+Shift+F')}")
+        self.hide_button = IconButton("eye_off", f"Hide to mini timer · {display_keys('Ctrl+H')}", 40, self.controls)
         self.more_button = IconButton("more", "More actions", 40, self.controls)
         _tab_only(self.pause_button, self.extend_button, self.finish_button, self.hide_button, self.more_button)
         for w in (self.pause_button, self.extend_button, self.finish_button):
@@ -854,7 +854,7 @@ class ActiveView(QWidget):
         brow.addStretch(1)
         self.skip_button = Button("Skip break", "secondary", icon="skip", size="lg", parent=self.break_controls)
         self.skip_button.setMinimumWidth(120)
-        self.break_hide_button = IconButton("eye_off", "Hide to mini timer · Ctrl+H", 40, self.break_controls)
+        self.break_hide_button = IconButton("eye_off", f"Hide to mini timer · {display_keys('Ctrl+H')}", 40, self.break_controls)
         _tab_only(self.skip_button, self.break_hide_button)
         brow.addWidget(self.skip_button)
         brow.addSpacing(4)
@@ -1129,6 +1129,9 @@ class ActiveView(QWidget):
     def _set_mode(self, mode: str) -> None:
         old = self._mode
         self._mode = mode
+        # A break that ends without starting the next block (time's up, Skip / End) hands what
+        # the user typed into "Next block" to the plan card (FocusPage → take_break_draft()).
+        self._break_draft = self._next_block_draft() if old == "break" and mode == "idle" else None
         focus_mode = mode == "focus"
         break_mode = mode == "break"
         leaving: list[QWidget] = []
@@ -1336,7 +1339,7 @@ class ActiveView(QWidget):
 
     # ================================================================== actions
     def _open_more_menu(self) -> None:
-        menu = Menu(self)
+        menu = Menu(self, delete_on_hide=True)
         menu.add_action("Abandon session…", self.confirm_abandon, icon="trash", danger=True)
         menu.popup_below(self.more_button, align="right")
 
@@ -1403,6 +1406,26 @@ class ActiveView(QWidget):
 
     def _on_next_edited(self, _text: str) -> None:
         self._next_edited = True
+
+    def _next_block_draft(self) -> tuple[str, int] | None:
+        if not self._next_edited:
+            return None
+        text = self.next_field.text().strip()
+        if not text:
+            return None
+        minutes, _task = self._next_minutes()
+        return text, minutes
+
+    def take_break_draft(self) -> tuple[str, int] | None:
+        """(title, minutes) the user typed into "Next block" during the break that just ended
+        without starting it (time's up, Skip / End) — handed out once. None when the prefill
+        was left as it was (FocusPage then prefills the plan card from Up next)."""
+        if self._mode == "break" and str(self._ctx.engine.state) == "idle":
+            self.refresh()  # the break's end reached FocusPage first: leave break mode now
+        draft, self._break_draft = self._break_draft, None
+        if draft is not None:
+            self._next_edited = False
+        return draft
 
     def _next_minutes(self) -> tuple[int, PlannedTask | None]:
         task = self._next_task

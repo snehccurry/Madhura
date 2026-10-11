@@ -1,13 +1,14 @@
 """Buttons: :class:`Button` (5 variants, 3 sizes), :class:`IconButton` and :class:`LinkButton`.
 
 All are custom-painted ``QPushButton`` subclasses: hover/press fade, crisp icons tinted to the text
-colour, and a 2 px accent focus ring that appears only for keyboard focus.
+colour, and a 2 px accent focus ring that appears only for keyboard focus. A focused button clicks
+on Space and on Return / Enter (QPushButton itself only takes Enter inside a QDialog).
 """
 
 from __future__ import annotations
 
 from PySide6.QtCore import QRectF, QSize, Qt
-from PySide6.QtGui import QColor, QEnterEvent, QFontMetrics, QPainter, QPaintEvent
+from PySide6.QtGui import QColor, QEnterEvent, QFontMetrics, QKeyEvent, QPainter, QPaintEvent
 from PySide6.QtWidgets import QPushButton, QSizePolicy, QWidget
 
 from madhura.ui import fonts, icons, theme
@@ -26,6 +27,18 @@ SIZES: dict[str, tuple[int, int, int, int]] = {
 
 _RADIUS = 8.0
 _ICON_GAP = 8
+
+
+def _click_on_enter(button: QPushButton, event: QKeyEvent) -> bool:
+    """Plain Return / Enter on a focused button clicks it (a held key clicks once). Returns True
+    when the event was handled; modified Enter (Ctrl+Enter = the sheet / window primary) is not."""
+    mods = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
+    if event.key() not in (Qt.Key.Key_Return, Qt.Key.Key_Enter) or mods != Qt.KeyboardModifier.NoModifier:
+        return False
+    if not event.isAutoRepeat() and button.isEnabled():
+        button.click()
+    event.accept()
+    return True
 
 
 def _variant_colors(variant: str, hover: float, pressed: bool) -> tuple[QColor, QColor | None, QColor]:
@@ -157,6 +170,10 @@ class Button(KeyboardFocusMixin, QPushButton):
         if not self.isEnabled():
             self._hover.set_target(0.0, animate=False)
 
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
+        if not _click_on_enter(self, event):
+            super().keyPressEvent(event)
+
     def paintEvent(self, _event: QPaintEvent) -> None:  # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -245,6 +262,10 @@ class IconButton(KeyboardFocusMixin, QPushButton):
 
     def sizeHint(self) -> QSize:  # noqa: N802
         return QSize(self.width(), self.height())
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
+        if not _click_on_enter(self, event):
+            super().keyPressEvent(event)
 
     def enterEvent(self, event: QEnterEvent) -> None:  # noqa: N802
         self._hover.set_target(1.0)
@@ -339,6 +360,10 @@ class LinkButton(KeyboardFocusMixin, QPushButton):
     def leaveEvent(self, event: object) -> None:  # noqa: N802
         self._hover.set_target(0.0)
         super().leaveEvent(event)  # type: ignore[arg-type]
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
+        if not _click_on_enter(self, event):
+            super().keyPressEvent(event)
 
     def _fg(self) -> QColor:
         pal = theme.palette()

@@ -9,6 +9,7 @@ icons stay sharp at 125–175 % scaling. Icon modes: Disabled → ``text_subtle`
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 
 from PySide6.QtCore import QByteArray, QRect, QRectF, QSize, Qt, qVersion
 from PySide6.QtGui import QColor, QGuiApplication, QIcon, QIconEngine, QImage, QPainter, QPixmap
@@ -191,8 +192,14 @@ _TEMPLATE = (
     'stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">{body}</svg>'
 )
 
-_pixmap_cache: dict[tuple[str, str, int, int, float], QPixmap] = {}
-_renderer_cache: dict[tuple[str, str], QSvgRenderer] = {}
+# Rendering: one parsed SVG per icon, one antialiased alpha mask per (icon, device size), tinted
+# per colour. Both caches of rendered images are bounded LRUs — hover fades ask for a new
+# interpolated colour every frame, so a plain dict would grow for as long as the app runs.
+_MASK_LIMIT = 256
+_PIXMAP_LIMIT = 512
+_pixmap_cache: OrderedDict[tuple[str, str, int, int, float], QPixmap] = OrderedDict()
+_mask_cache: OrderedDict[tuple[str, int, int], QImage] = OrderedDict()
+_renderer_cache: dict[str, QSvgRenderer] = {}
 
 
 def names() -> list[str]:
@@ -208,6 +215,7 @@ def has(name: str) -> bool:
 def clear_cache() -> None:
     """Drop all rendered pixmaps (called on theme change)."""
     _pixmap_cache.clear()
+    _mask_cache.clear()
     _renderer_cache.clear()
 
 
@@ -229,13 +237,33 @@ def svg(name: str, color: QColor | str = "currentColor") -> str:
     return doc
 
 
-def _renderer(name: str, rgb: str) -> QSvgRenderer:
-    key = (name, rgb)
-    r = _renderer_cache.get(key)
+def _renderer(name: str) -> QSvgRenderer:
+    r = _renderer_cache.get(name)
     if r is None:
-        r = QSvgRenderer(QByteArray(svg(name, rgb).encode("utf-8")))
-        _renderer_cache[key] = r
+        r = QSvgRenderer(QByteArray(svg(name, "#000000").encode("utf-8")))
+        _renderer_cache[name] = r
     return r
+
+
+def _mask(name: str, pw: int, ph: int) -> QImage:
+    """The glyph's coverage (alpha) at *pw*×*ph* device pixels, centred in a square."""
+    key = (name, pw, ph)
+    img = _mask_cache.get(key)
+    if img is not None:
+        _mask_cache.move_to_end(key)
+        return img
+    img = QImage(pw, ph, QImage.Format.Format_ARGB32_Premultiplied)
+    img.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(img)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+    side = min(pw, ph)
+    _renderer(name).render(painter, QRectF((pw - side) / 2.0, (ph - side) / 2.0, side, side))
+    painter.end()
+    _mask_cache[key] = img
+    if len(_mask_cache) > _MASK_LIMIT:
+        _mask_cache.popitem(last=False)
+    return img
 
 
 def _logical_scaled() -> bool:
@@ -276,24 +304,21 @@ def pixmap(
     key = (name, c.name(QColor.NameFormat.HexArgb), w, h, round(ratio, 3))
     cached = _pixmap_cache.get(key)
     if cached is not None:
+        _pixmap_cache.move_to_end(key)
         return cached
     pw, ph = max(1, int(round(w * ratio))), max(1, int(round(h * ratio)))
-    img = QImage(pw, ph, QImage.Format.Format_ARGB32_Premultiplied)
-    img.fill(Qt.GlobalColor.transparent)
+    img = QImage(_mask(name, pw, ph))  # copy-on-write: the cached mask stays untouched
     painter = QPainter(img)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-    if c.alphaF() < 1.0:
-        painter.setOpacity(c.alphaF())
-    side = min(pw, ph)
-    target = QRectF((pw - side) / 2.0, (ph - side) / 2.0, side, side)
-    _renderer(name, c.name(QColor.NameFormat.HexRgb)).render(painter, target)
+    # Tint: keep the mask's coverage, take the colour (its alpha multiplies the coverage). Every
+    # glyph is single-colour (currentColor), so this equals rendering the SVG in that colour.
+    painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+    painter.fillRect(img.rect(), c)
     painter.end()
     pm = QPixmap.fromImage(img)
     pm.setDevicePixelRatio(ratio)
-    if len(_pixmap_cache) > 2048:
-        _pixmap_cache.clear()
     _pixmap_cache[key] = pm
+    if len(_pixmap_cache) > _PIXMAP_LIMIT:
+        _pixmap_cache.popitem(last=False)
     return pm
 
 

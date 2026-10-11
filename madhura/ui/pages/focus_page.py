@@ -170,7 +170,8 @@ class FocusPage(QWidget):
         if index != previous:
             self._switch_to(index)
         if index == IDLE and previous != IDLE:
-            self.idle_view.on_returned_to_idle()
+            # What the user typed into the break's "Next block" wins over the Up next prefill.
+            self.idle_view.on_returned_to_idle(self.active_view.take_break_draft())
             self._apply_deferred_focus()
         self._refresh_active_banners()
 
@@ -312,7 +313,7 @@ class FocusPage(QWidget):
         self._ctx.engine.abandon()
 
     def _open_paused_snooze(self) -> None:
-        menu = Menu(self)
+        menu = Menu(self, delete_on_hide=True)
         for label, minutes in (("15 min", 15), ("30 min", 30), ("1 hour", 60)):
             menu.add_action(label, lambda m=minutes: self._snooze(m))
         self._paused_menu = menu

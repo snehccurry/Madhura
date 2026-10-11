@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sqlite3
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -19,6 +20,8 @@ __all__ = [
     "user_version",
     "quick_check",
     "open_database",
+    "DatabaseUnavailable",
+    "is_unavailable_error",
     "quarantine",
     "checkpoint_and_close",
     "backup_to",
@@ -29,6 +32,55 @@ log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 _KEEP_MIGRATION_BACKUPS = 2
+
+#: Pauses between attempts when the file can't be opened right now (I/O error, drive not ready).
+#: A locked file is not retried: SQLite's busy handler has already waited.
+OPEN_RETRY_DELAYS_S: tuple[float, ...] = (0.25, 0.75)
+
+# Primary result codes that mean "can't get at the file right now", not "the file is damaged":
+# PERM, BUSY, LOCKED, READONLY, IOERR, FULL, CANTOPEN, PROTOCOL. Corruption is SQLITE_CORRUPT /
+# SQLITE_NOTADB, which Python raises as plain DatabaseError, never OperationalError.
+_UNAVAILABLE_CODES = frozenset({3, 5, 6, 8, 10, 13, 14, 15})
+# Python 3.10 has no ``sqlite_errorcode``: match SQLite's messages for the same codes.
+_UNAVAILABLE_MESSAGES = (
+    "access permission denied",
+    "database is locked",
+    "database table is locked",
+    "readonly database",
+    "disk i/o error",
+    "database or disk is full",
+    "unable to open database",
+    "locking protocol",
+)
+
+
+class DatabaseUnavailable(Exception):
+    """The database exists but can't be opened right now (locked by another program, I/O error,
+    read-only, drive not reachable). Nothing was renamed or created."""
+
+    def __init__(self, path: Path, reason: BaseException) -> None:
+        super().__init__(f"{path} can't be opened right now: {reason}")
+        self.path = path
+        self.reason = reason
+
+
+def is_unavailable_error(exc: BaseException) -> bool:
+    """True for SQLite errors meaning the file is unreachable/locked rather than corrupt."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        return (code & 0xFF) in _UNAVAILABLE_CODES
+    text = str(exc).lower()
+    return any(m in text for m in _UNAVAILABLE_MESSAGES)
+
+
+def _is_busy(exc: BaseException) -> bool:
+    """SQLITE_BUSY / SQLITE_LOCKED: SQLite's busy handler has already waited before raising."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        return (code & 0xFF) in (5, 6)
+    return "is locked" in str(exc).lower()
 
 _V1 = [
     """
@@ -146,10 +198,16 @@ def user_version(conn: sqlite3.Connection) -> int:
 
 
 def quick_check(conn: sqlite3.Connection) -> bool:
-    """True when ``PRAGMA quick_check`` reports 'ok'."""
+    """True when ``PRAGMA quick_check`` reports 'ok'.
+
+    A locked or unreachable file raises (see :func:`is_unavailable_error`) instead of reading as
+    damaged.
+    """
     try:
         rows = conn.execute("PRAGMA quick_check").fetchall()
-    except sqlite3.DatabaseError:
+    except sqlite3.DatabaseError as exc:
+        if is_unavailable_error(exc):
+            raise
         return False
     return len(rows) == 1 and str(rows[0][0]).lower() == "ok"
 
@@ -253,7 +311,10 @@ def open_database(
 ) -> tuple[sqlite3.Connection, Path | None]:
     """Open + verify + migrate *db_file*; on corruption quarantine it and start fresh.
 
-    Returns ``(connection, quarantined_path_or_None)``. ``":memory:"`` is supported.
+    Returns ``(connection, quarantined_path_or_None)``. ``":memory:"`` is supported. A file that
+    is only locked or unreachable is retried (:data:`OPEN_RETRY_DELAYS_S`) and then raises
+    :class:`DatabaseUnavailable` without touching anything, so a healthy database is never
+    mistaken for a damaged one.
     """
     if os.fspath(db_file) == ":memory:":
         conn = connect(":memory:")
@@ -261,11 +322,24 @@ def open_database(
         return conn, None
     path = Path(db_file)
     path.parent.mkdir(parents=True, exist_ok=True)
+    delays = list(OPEN_RETRY_DELAYS_S)
+    while True:
+        try:
+            return _open_checked(path), None
+        except sqlite3.DatabaseError as exc:
+            if not is_unavailable_error(exc):
+                log.exception("Database %s is unreadable; starting fresh", path)
+                break
+            if not delays or _is_busy(exc):
+                log.error("Database %s can't be opened right now: %s", path, exc)
+                raise DatabaseUnavailable(path, exc) from exc
+            log.warning("Database %s can't be opened right now (%s); retrying", path, exc)
+            time.sleep(delays.pop(0))
     try:
-        return _open_checked(path), None
-    except sqlite3.DatabaseError:
-        log.exception("Database %s is unreadable; starting fresh", path)
-    moved = quarantine(path, clock)
+        moved = quarantine(path, clock)
+    except OSError as exc:  # e.g. Windows: another process still has the file open
+        log.error("Could not move the damaged database %s aside: %s", path, exc)
+        raise DatabaseUnavailable(path, exc) from exc
     conn = connect(path)
     migrate(conn, path)
     if on_recovered is not None:

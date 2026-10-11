@@ -366,6 +366,22 @@ def test_logical_day_is_used(hshell: AppContext) -> None:
     assert _status(ctx, hid, date(2026, 10, 15)) is None
 
 
+def test_habit_created_after_midnight_belongs_to_the_logical_day(hshell: AppContext) -> None:
+    ctx = hshell
+    set_now(ctx, datetime(2026, 10, 15, 1, 30))  # 01:30 Thursday → logical Wednesday (day start 4)
+    hid = add_habit(ctx, "Stretch", created=datetime(2026, 10, 15, 1, 30))
+    page = habits_page(ctx)
+    m = page.model(hid)
+    assert m.scheduled and m.state == "none"
+    assert [s for _d, s in m.last7][-2:] == ["unscheduled", "pending"]  # Tue before creation, Wed today
+    # next morning, the untouched Wednesday was a real (missed) day of the habit
+    set_now(ctx, datetime(2026, 10, 15, 9, 0))
+    page.refresh()
+    m = page.model(hid)
+    assert [s for _d, s in m.last7][-3:] == ["unscheduled", "missed", "pending"]
+    assert m.missed_previous and m.caption == "Missed yesterday · don't miss twice"
+
+
 def test_day_changed_refreshes(hshell: AppContext) -> None:
     ctx = hshell
     hid = add_habit(ctx, "Water")
@@ -420,9 +436,12 @@ def test_editor_reminder_needs_time_and_urgent_follows_reminder(hshell: AppConte
     assert not sheet.time_toggle.isChecked()
     assert not sheet.reminder_toggle.isEnabled() and not sheet.reminder_toggle.isChecked()
     assert sheet.reminder_row.description.text() == "Reminders need a time"
-    assert not sheet.urgent_toggle.isEnabled()
+    # the inactive row reads as inactive (dimmed title, like the urgent row) but its hint stays readable
+    assert not sheet.reminder_row.title.isEnabled() and sheet.reminder_row.description.isEnabled()
+    assert not sheet.urgent_toggle.isEnabled() and not sheet.urgent_row.title.isEnabled()
     sheet.time_toggle.setChecked(True)
     assert sheet.reminder_toggle.isEnabled() and sheet.reminder_toggle.isChecked()
+    assert sheet.reminder_row.title.isEnabled()
     assert sheet.reminder_row.description.text() == "" and sheet.urgent_toggle.isEnabled()
     sheet.reminder_toggle.click()  # user turns reminders off
     assert not sheet.reminder_toggle.isChecked() and not sheet.urgent_toggle.isEnabled()
@@ -505,6 +524,34 @@ def test_editor_suggestion_chips_prefill(hshell: AppContext) -> None:
     assert sheet.focus_box.isVisibleTo(sheet)
     assert suggestion_for("ship SOMETHING small").emoji == "🚀"
     assert HabitEditorSheet(ctx, preset="Plan tomorrow").name_field.text() == "Plan tomorrow"
+
+
+def test_editor_opened_with_a_name_places_the_cursor_usefully(hshell: AppContext) -> None:
+    """A prefilled name is selected (new habit from a preset) or has the cursor at its end
+    (editing) once the sheet focuses it — never the cursor parked before the first letter."""
+    ctx = hshell
+    page = habits_page(ctx)
+    win_of(ctx).activateWindow()
+    sheet = page.new_habit("Work deeply on your main project")
+    pump(10)
+    edit = sheet.name_field.line_edit
+    assert edit.hasFocus()
+    assert edit.selectedText() == "Work deeply on your main project"
+    sheet.close_sheet()
+    pump(10)
+    hid = add_habit(ctx, "Read 10 pages")
+    sheet = page.edit_habit(hid)
+    pump(10)
+    edit = sheet.name_field.line_edit
+    assert edit.hasFocus() and not edit.hasSelectedText()
+    assert edit.cursorPosition() == len("Read 10 pages")
+    sheet.close_sheet()
+    pump(10)
+    sheet = page.new_habit()  # empty name: nothing to select
+    pump(10)
+    assert sheet.name_field.line_edit.hasFocus() and sheet.name_field.text() == ""
+    sheet.close_sheet()
+    pump(10)
 
 
 def test_editor_emoji_popover_and_typing(hshell: AppContext) -> None:

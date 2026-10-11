@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import wave
 from array import array
 from pathlib import Path
@@ -88,28 +89,73 @@ def test_coalescing_by_priority(player: SoundPlayer, launched: list[Path], setti
     assert len(launched) == 4
 
 
+def _peak(path: Path) -> int:
+    with wave.open(str(path), "rb") as w:
+        assert w.getsampwidth() == 2
+        data = array("h")
+        data.frombytes(w.readframes(w.getnframes()))
+    return max(abs(x) for x in data)
+
+
 def test_scaled_wav_cached_and_scaled(player: SoundPlayer, tmp_path: Path) -> None:
     full = player.scaled_wav(100)
+    full_peak = _peak(full)
     half = player.scaled_wav(50)
     assert full.name == "chime_v100.wav" and half.name == "chime_v50.wav"
     assert full.parent == tmp_path / "cache" / "sounds"
     mtime = half.stat().st_mtime_ns
     assert player.scaled_wav(50) == half and half.stat().st_mtime_ns == mtime  # cached
 
-    def peak(path: Path) -> int:
-        with wave.open(str(path), "rb") as w:
-            assert w.getsampwidth() == 2
-            data = array("h")
-            data.frombytes(w.readframes(w.getnframes()))
-        return max(abs(x) for x in data)
-
     with wave.open(str(sound_mod.paths.asset("sounds/chime.wav")), "rb") as src:
         nframes = src.getnframes()
         channels = src.getnchannels()
     with wave.open(str(half), "rb") as w:
         assert w.getnframes() == nframes and w.getnchannels() == channels
-    assert peak(half) == pytest.approx(peak(full) * 0.25, rel=0.01)
-    assert peak(player.scaled_wav(0)) == 0
+    assert _peak(half) == pytest.approx(full_peak * 0.25, rel=0.01)
+    assert _peak(player.scaled_wav(0)) == 0
+
+
+def test_scaled_wav_keeps_only_the_current_volume(player: SoundPlayer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """One ≈0.5 MB file per volume ever used would pile up (up to 101 files)."""
+    folder = tmp_path / "cache" / "sounds"
+    for volume in (10, 20, 30):
+        player.scaled_wav(volume)
+    (folder / "chime_v55.wav.tmp").write_bytes(b"stale")  # left by an interrupted write
+    (folder / "other.wav").write_bytes(b"not ours")
+    current = player.scaled_wav(40)
+    assert sorted(p.name for p in folder.iterdir()) == ["chime_v40.wav", "other.wav"]
+    assert player.scaled_wav(40) == current  # still cached
+
+    # Windows: a file still being played can't be deleted → skipped now, removed on a later write.
+    real_unlink = Path.unlink
+
+    def busy(self: Path, missing_ok: bool = False) -> None:
+        if self.name == "chime_v40.wav":
+            raise PermissionError(32, "in use")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", busy)
+    player.scaled_wav(60)
+    assert sorted(p.name for p in folder.glob("chime_v*")) == ["chime_v40.wav", "chime_v60.wav"]
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    player.scaled_wav(70)
+    assert sorted(p.name for p in folder.glob("chime_v*")) == ["chime_v70.wav"]
+
+
+def test_playback_failure_is_logged_once_at_warning(player: SoundPlayer, caplog: pytest.LogCaptureFixture) -> None:
+    """A broken player must leave a trace in madhura.log (INFO), but not one per chime."""
+    import logging
+
+    if sys.platform in ("win32", "darwin"):
+        pytest.skip("Linux player path")
+    caplog.set_level(logging.DEBUG, logger="madhura.services.sound")
+    player._linux_resolved = True
+    player._linux_player = "/nonexistent/madhura-test-player"
+    assert player._launch(player.scaled_wav(40)) is False
+    assert player._launch(player.scaled_wav(40)) is False
+    records = [r for r in caplog.records if r.getMessage() == "Sound playback failed"]
+    assert [r.levelno for r in records] == [logging.WARNING, logging.DEBUG]
+    assert records[0].exc_info is not None
 
 
 def test_play_launches_scaled_file(player: SoundPlayer, launched: list[Path], settings_store) -> None:

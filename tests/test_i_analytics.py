@@ -325,6 +325,20 @@ def test_habit_completion_counts_rules() -> None:
     assert an.habit_completion([weekdays, daily, new], logs, start, end, today=WED) == pytest.approx(4 / 5)
 
 
+def test_habit_completion_uses_the_logical_creation_day() -> None:
+    # created Thu 15 Oct 01:30 with a 04:00 day start = logical Wednesday, done that day
+    h = H(1, created=datetime(2026, 10, 15, 1, 30))
+    logs = [L(1, WED)]
+    assert an.habit_completion_counts([h], logs, WED, WED, today=WED, day_start_hour=4) == (1, 1)
+    assert an.habit_completion_counts([h], logs, date(2026, 10, 12), WED, today=WED, day_start_hour=4) == (1, 1)
+    assert an.habit_completion([h], logs, date(2026, 10, 12), WED, today=WED, day_start_hour=4) == pytest.approx(1.0)
+    # the next day, a missed Wednesday is a scheduled day too
+    thu = WED + timedelta(days=1)
+    assert an.habit_completion_counts([h], [], WED, thu, today=thu, day_start_hour=4) == (0, 1)
+    # with a midnight day start the habit only exists from Thursday
+    assert an.habit_completion_counts([h], logs, WED, WED, today=WED) == (0, 0)
+
+
 def test_habit_completion_without_today_counts_everything() -> None:
     logs = [L(1, date(2026, 10, 12))]
     assert an.habit_completion_counts([H(1)], logs, date(2026, 10, 12), date(2026, 10, 13)) == (1, 2)

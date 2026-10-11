@@ -4,7 +4,10 @@ launch-at-login truth, data actions (export, legacy import, restore, reset) and 
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import sys
+from collections.abc import Callable
 from datetime import date, datetime
 from pathlib import Path
 
@@ -56,7 +59,8 @@ def test_groups_in_spec_order_and_max_width(s_shell: AppContext) -> None:
 
 def test_controls_are_named_for_accessibility(s_shell: AppContext) -> None:
     page = settings_page(s_shell)
-    assert page.controls["checkin_enabled"].accessibleName() == "Check-ins"
+    assert page.controls["checkin_enabled"].accessibleName() == "Ask during sessions"
+    assert page.controls["breaks_enabled"].accessibleName() == "Offer breaks"
     assert page.controls["reduce_motion"].accessibleName() == "Reduce motion"
     assert page.controls["launch_at_login"].accessibleName() == "Launch at login"
     assert page.accent_picker.accessibleName() == "Accent color"
@@ -169,6 +173,24 @@ def test_nudge_mode_explanations(s_shell: AppContext) -> None:
     assert set(NUDGE_EXPLANATIONS) == {"off", "gentle", "firm"}
 
 
+def test_copy_is_consistent_with_onboarding(s_shell: AppContext) -> None:
+    from madhura.ui.overlays.onboarding import BENEFITS
+    from madhura.ui.pages._settings_kit import NUDGE_CHOICES
+
+    page = settings_page(s_shell)
+    # One description of Gentle, wherever it's offered.
+    cards = {mode: body for mode, _title, body, _icon in NUDGE_CHOICES}
+    assert cards["gentle"] == NUDGE_EXPLANATIONS["gentle"]
+    # The check-in prompt is quoted exactly as it appears in a session.
+    quoted = [caption for _icon, _title, caption in BENEFITS if "on it?" in caption]
+    assert quoted and all("“Still on it?”" in caption for caption in quoted)
+    assert "“Still on it?”" in page.rows["checkin_enabled"].description_label.text()
+    # No row repeats the title of the group it sits in.
+    for title, group in page.groups.items():
+        row_titles = [r.title_label.text() for r in group.rows() if isinstance(r, sp.SettingsRow)]
+        assert title not in row_titles, title
+
+
 def test_idle_minutes_and_work_days(s_shell: AppContext) -> None:
     page = settings_page(s_shell)
     idle = page.controls["nudge_idle_minutes"]
@@ -267,11 +289,20 @@ def test_sound_event_toggles(s_shell: AppContext, qtbot, k: str) -> None:
 # =========================================================================== Appearance
 
 
-def test_theme_and_time_format(s_shell: AppContext) -> None:
+def test_theme_and_time_format(s_shell: AppContext, qtbot) -> None:  # noqa: ANN001
     page = settings_page(s_shell)
     seg = page.controls["theme"]
+    seen = record(s_shell.settings.changed)
+    # Every theme change re-styles the whole app (~0.5 s): arrowing across the options moves the
+    # selection at once and applies only where the user stops.
+    key(seg, K.Key_Left)
     key(seg, K.Key_End)
-    assert _get(s_shell, "theme") == "light" and s_shell.theme.scheme == "light"
+    assert seg.value() == "light" and _get(s_shell, "theme") == "dark"
+    qtbot.waitUntil(lambda: _get(s_shell, "theme") == "light", timeout=2000)
+    assert s_shell.theme.scheme == "light" and seen.count("theme") == 1
+    key(seg, K.Key_Home)
+    key(seg, K.Key_Return)  # Enter applies at once
+    assert _get(s_shell, "theme") == "system"
     s_shell.settings.update(theme="dark")
     assert seg.value() == "dark"
 
@@ -297,26 +328,36 @@ def test_reduce_motion_toggle(s_shell: AppContext, qtbot) -> None:
     assert toggle.isChecked()
 
 
-def test_accent_swatches_keyboard_navigation(s_shell: AppContext) -> None:
+def test_accent_swatches_keyboard_navigation(s_shell: AppContext, qtbot) -> None:  # noqa: ANN001
     page = settings_page(s_shell)
     picker = page.accent_picker
     assert picker.names() == ["indigo", "teal", "rose", "amber", "violet"]
     assert picker.value() == "indigo"
     picker.setFocus(Qt.FocusReason.TabFocusReason)
+    seen = record(s_shell.settings.changed)
+    # Arrow keys select at once; the (expensive) app re-style happens once, where the user stops.
     key(picker, K.Key_Right)
-    assert _get(s_shell, "accent") == "teal" and s_shell.theme.accent == "teal"
-    assert picker.accessibleDescription() == "Teal selected"
+    assert picker.value() == "teal" and picker.accessibleDescription() == "Teal selected"
     key(picker, K.Key_Down)
-    assert _get(s_shell, "accent") == "rose"
+    assert picker.value() == "rose" and _get(s_shell, "accent") == "indigo"
+    qtbot.waitUntil(lambda: _get(s_shell, "accent") == "rose", timeout=2000)
+    assert s_shell.theme.accent == "rose" and seen.count("accent") == 1
     key(picker, K.Key_End)
-    assert _get(s_shell, "accent") == "violet"
+    assert picker.value() == "violet"
     key(picker, K.Key_Right)  # wraps
-    assert _get(s_shell, "accent") == "indigo"
+    assert picker.value() == "indigo"
     key(picker, K.Key_Left)
-    assert _get(s_shell, "accent") == "violet"
+    assert picker.value() == "violet"
+    key(picker, K.Key_Return)  # Enter applies at once
+    assert _get(s_shell, "accent") == "violet" and seen.count("accent") == 2
     key(picker, K.Key_Home)
+    assert picker.value() == "indigo" and picker.focus_ring_rect() == picker.swatch_rect(0)
+    picker.clearFocus()  # leaving the control applies at once too
     assert _get(s_shell, "accent") == "indigo"
-    assert picker.focus_ring_rect() == picker.swatch_rect(0)
+    key(picker, K.Key_Right)
+    key(picker, K.Key_Left)  # back where it started: nothing to apply
+    qtbot.wait(400)
+    assert seen.count("accent") == 3
     # External change: silent sync.
     emitted = record(picker.valueChanged)
     s_shell.settings.update(accent="amber")
@@ -610,6 +651,35 @@ def test_schedule_relaunch_registers_and_cancels(monkeypatch: pytest.MonkeyPatch
     assert len(registered) == 1
     cancel()
     assert registered == []
+
+
+def test_relaunch_of_a_frozen_build_starts_fresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A PyInstaller onefile child must not hand its (soon deleted) extraction folder on."""
+    from PySide6 import QtCore
+
+    registered: list[Callable[[], None]] = []
+    launched: list[tuple[str, list[str], dict[str, str]]] = []
+
+    class FakeProcess:
+        @staticmethod
+        def startDetached(program: str, args: list[str], _cwd: str) -> tuple[bool, int]:  # noqa: N802
+            launched.append((program, list(args), dict(os.environ)))
+            return True, 4242
+
+    # What a onefile child inherits from its bootloader (setenv records each one for teardown).
+    monkeypatch.setenv("_PYI_APPLICATION_HOME_DIR", "/tmp/_MEIabc")
+    monkeypatch.setenv("_PYI_PARENT_PROCESS_LEVEL", "1")
+    monkeypatch.setenv("PYINSTALLER_RESET_ENVIRONMENT", "0")
+    monkeypatch.setattr(QtCore, "QProcess", FakeProcess)
+    monkeypatch.setattr(sp.atexit, "register", registered.append)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    sp._schedule_relaunch([r"C:\Apps\Madhura.exe"])  # noqa: SLF001
+    registered[0]()
+    assert len(launched) == 1
+    program, args, child_env = launched[0]
+    assert program == r"C:\Apps\Madhura.exe" and args == []
+    assert child_env.get("PYINSTALLER_RESET_ENVIRONMENT") == "1"
+    assert not [k for k in child_env if k.startswith("_PYI_")]
 
 
 # --------------------------------------------------------------------------- reset

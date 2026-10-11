@@ -5,7 +5,8 @@
 captures, each [→ Tomorrow's Up next] / [Clear]; (d) an optional "One thing that went well"
 (``repo.set_day_note``); (e) "Tomorrow's first block" → a task at position 0 for
 ``core.days.next_work_day``. Primary "Shutdown complete" saves (d)/(e), calls
-``ctx.nudges.done_for_today()`` and closes.
+``ctx.nudges.done_for_today()`` and closes. Closed any other way ("Not now", Esc) the sheet still
+keeps what was typed in (d)/(e) — only the nudges stay on.
 
 Row actions apply immediately (with an Undo toast) and emit ``data_changed('tasks'|'captures')``.
 When the next work day is not tomorrow (e.g. on a Friday) the copy names it ("Monday").
@@ -34,6 +35,12 @@ from madhura.ui.widgets.inputs import TextField
 from madhura.ui.widgets.labels import Badge, Caption, Label, Micro, SectionHeader
 from madhura.ui.widgets.list_row import ListRow
 from madhura.ui.widgets.sheet import SheetContent
+
+try:
+    from shiboken6 import isValid as _is_valid
+except ImportError:  # pragma: no cover
+    def _is_valid(_obj: object) -> bool:
+        return True
 
 if TYPE_CHECKING:
     from madhura.context import AppContext
@@ -244,6 +251,11 @@ class WrapUpSheet(SheetContent):
             self.went_well.set_text(ctx.repo.get_day_note(self._today) or "")
         except sqlite3.Error:
             log.debug("Could not read today's note", exc_info=True)
+        # What save_inputs() last wrote (it runs on "Shutdown complete" and again on close).
+        self._saved_note = self.went_well.text().strip()
+        self._first_task_id: int | None = None
+        self._saved_first: tuple[str, int] | None = None
+        self._shut_down = False
         self.body.addWidget(self.went_well)
         self.body.addSpacing(4)
 
@@ -274,6 +286,7 @@ class WrapUpSheet(SheetContent):
         self.add_footer_button(self.done_button, primary=True)
 
         theme.current().changed.connect(self._sync_icons)
+        self.finished.connect(self._on_finished)
         self._sync_icons()
         self.refresh()
 
@@ -307,6 +320,11 @@ class WrapUpSheet(SheetContent):
             window.show_toast(text, kind)
         else:
             window.show_toast(text, kind, "Undo", undo, UNDO_MS)
+
+    def _refresh_if_open(self) -> None:
+        """For Undo callbacks: the toast outlives the sheet, which is deleted once closed."""
+        if _is_valid(self) and self.host() is not None:
+            self.refresh()
 
     def _changed(self, *kinds: str) -> None:
         for kind in kinds:
@@ -417,7 +435,7 @@ class WrapUpSheet(SheetContent):
         def undo() -> None:
             repo.update_task(task_id, plan_date=task.plan_date, position=task.position)
             self._changed("tasks")
-            self.refresh()
+            self._refresh_if_open()
 
         self._toast(f"Moved {_quote(task.title)} to {self._word}", undo)
 
@@ -436,7 +454,7 @@ class WrapUpSheet(SheetContent):
                 for t in tasks:
                     repo.update_task(t.id, plan_date=t.plan_date, position=t.position)
             self._changed("tasks")
-            self.refresh()
+            self._refresh_if_open()
 
         n = len(tasks)
         self._toast(f"Moved {n} task{'s' if n != 1 else ''} to {self._word}", undo)
@@ -455,7 +473,7 @@ class WrapUpSheet(SheetContent):
             new_id = repo.add_task(task.title, task.minutes, task.project, plan_date=task.plan_date, position=task.position)
             repo.update_task(new_id, created_at=task.created_at)
             self._changed("tasks")
-            self.refresh()
+            self._refresh_if_open()
 
         self._toast(f"Dropped {_quote(task.title)}", undo)
 
@@ -477,7 +495,7 @@ class WrapUpSheet(SheetContent):
                 repo.delete_task(task_id)
                 repo.set_capture_done(capture_id, False)
             self._changed("tasks", "captures")
-            self.refresh()
+            self._refresh_if_open()
 
         self._toast(f"Added to {self._word}'s Up next", undo)
 
@@ -491,7 +509,7 @@ class WrapUpSheet(SheetContent):
         def undo() -> None:
             repo.set_capture_done(capture_id, False)
             self._changed("captures")
-            self.refresh()
+            self._refresh_if_open()
 
         self._toast("Cleared from the parking lot", undo)
 
@@ -509,20 +527,59 @@ class WrapUpSheet(SheetContent):
         self.first_minutes.setAccessibleName(f"Length {fmt_preset(self._first_minutes)}")
 
     # ------------------------------------------------------------------ finish
+    def save_inputs(self) -> int | None:
+        """Save "One thing that went well" and the next day's first block (a task at position 0).
+
+        Idempotent: a later call updates (or, emptied, removes) what an earlier one saved instead
+        of adding a second task. Returns the id of the first-block task when this call created it.
+        """
+        repo = self._ctx.repo
+        if getattr(repo, "closed", False):
+            return None
+        created: int | None = None
+        try:
+            note = self.went_well.text().strip()
+            if note != self._saved_note:
+                repo.set_day_note(self._today, note or None)
+                self._saved_note = note
+            first = (self.first_block.text().strip(), self._first_minutes)
+            if self._first_task_id is None:
+                if first[0]:
+                    created = repo.add_task(first[0], first[1], None, plan_date=self._next_day, position=0)
+                    self._first_task_id = created
+                    self._changed("tasks")
+            elif first != self._saved_first:
+                if first[0]:
+                    repo.update_task(self._first_task_id, title=first[0], minutes=first[1])
+                else:
+                    repo.delete_task(self._first_task_id)
+                    self._first_task_id = None
+                self._changed("tasks")
+            self._saved_first = first if self._first_task_id is not None else None
+        except sqlite3.Error:
+            log.exception("Could not save the wrap-up")
+        return created
+
+    def _on_finished(self) -> None:
+        """Closed without "Shutdown complete" ("Not now", Esc): keep what was typed."""
+        if self._shut_down:
+            return
+        task_id = self.save_inputs()
+        if task_id is None:
+            return
+        repo, events = self._ctx.repo, self._ctx.events  # the toast outlives the closed sheet
+
+        def undo() -> None:
+            repo.delete_task(task_id)
+            events.data_changed.emit("tasks")
+
+        self._toast(f"Added {_quote(self.first_block.text().strip())} to {self._word}'s Up next", undo)
+
     def shutdown(self) -> None:
         """"Shutdown complete": save the note and first block, done for today, close."""
         ctx = self._ctx
-        repo = ctx.repo
-        try:
-            note = self.went_well.text().strip()
-            if note or repo.get_day_note(self._today):
-                repo.set_day_note(self._today, note or None)
-            first = self.first_block.text().strip()
-            if first:
-                repo.add_task(first, self._first_minutes, None, plan_date=self._next_day, position=0)
-                self._changed("tasks")
-        except sqlite3.Error:
-            log.exception("Could not save the wrap-up")
+        self._shut_down = True
+        self.save_inputs()
         if ctx.nudges is not None:
             try:
                 ctx.nudges.done_for_today()

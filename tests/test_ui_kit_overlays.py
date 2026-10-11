@@ -9,7 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
 from PySide6.QtCore import QRect, QSize, Qt, QTimer  # noqa: E402
-from PySide6.QtGui import QColor, QGuiApplication  # noqa: E402
+from PySide6.QtGui import QColor, QGuiApplication, QKeySequence  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QLineEdit, QVBoxLayout, QWidget  # noqa: E402
 
@@ -110,6 +110,28 @@ def test_floating_panel_flags_and_content(qtbot) -> None:  # type: ignore[no-unt
     assert btn is not None and btn.focusPolicy() == Qt.FocusPolicy.NoFocus
     assert p.width() == 340 + 2 * 16
     assert p.card_size().width() == 340
+
+
+def test_too_wide_content_is_laid_out_at_its_real_width(qtbot) -> None:  # type: ignore[no-untyped-def]
+    """Qt widens a window to its minimum size; the stack must place the card at that width,
+    or its right edge runs past the screen."""
+    p = FloatingPanel("completion")
+    body = QWidget()
+    lay = QVBoxLayout(body)
+    lay.setContentsMargins(0, 0, 0, 0)
+    wide = QWidget()
+    wide.setMinimumWidth(380)  # wider than the 340 − 2 × 16 content area
+    lay.addWidget(wide)
+    p.set_content(body)
+    _KEEP.append(p)
+    assert p.card_size().width() == p.minimumSizeHint().width() - 2 * 16 >= 380
+    p.present()
+    QApplication.processEvents()
+    screen = p.screen().availableGeometry()
+    assert p.visual_geometry().right() <= screen.right()
+    assert p.visual_geometry().width() == p.card_size().width()
+    p.dismiss(animate=False)
+    QApplication.processEvents()
 
 
 def test_stack_positions_and_priorities(qtbot) -> None:  # type: ignore[no-untyped-def]
@@ -352,6 +374,31 @@ def test_tall_sheet_pins_its_footer(qtbot) -> None:  # type: ignore[no-untyped-d
     assert not host.has_sheet() and sheet.isAncestorOf(sheet.ok)
 
 
+def test_sheet_scrollbar_stays_inside_the_rounded_card(qtbot) -> None:  # type: ignore[no-untyped-def]
+    """The scrolling body's bar must not run along the card border or through the rounded
+    top-right corner (radius 16)."""
+    from PySide6.QtWidgets import QStyle, QStyleOptionSlider
+
+    from madhura.ui.widgets.sheet import SHEET_RADIUS
+
+    win = _window(qtbot, 800, 420)
+    host = SheetHost(win)
+    sheet = _Sheet("Tall")
+    for i in range(14):
+        sheet.body.addWidget(QLabel(f"Row {i}"))
+    host.show_sheet(sheet)
+    QApplication.processEvents()
+    bar = host._card.scroll.verticalScrollBar()  # noqa: SLF001
+    assert bar.isVisible() and bar.sizeHint().width() == 10  # the pinned footer pads by this width
+    opt = QStyleOptionSlider()
+    bar.initStyleOption(opt)
+    groove = bar.style().subControlRect(QStyle.ComplexControl.CC_ScrollBar, opt, QStyle.SubControl.SC_ScrollBarGroove, bar)
+    top_left = bar.mapTo(host, groove.topLeft())
+    card = host.card_geometry()
+    assert top_left.y() - card.top() >= SHEET_RADIUS
+    assert card.right() - (top_left.x() + groove.width() - 1) >= 3
+
+
 def test_sheet_escape_and_ctrl_enter(qtbot) -> None:  # type: ignore[no-untyped-def]
     win = _window(qtbot)
     host = SheetHost(win)
@@ -404,6 +451,57 @@ def test_confirm_sheet(qtbot) -> None:  # type: ignore[no-untyped-def]
     assert rej == [2]
 
 
+def test_closed_sheets_are_deleted(qtbot) -> None:  # type: ignore[no-untyped-def]
+    """A closed (or dequeued) sheet must not live on as a hidden parentless window: sheets whose
+    closures capture them are cycles through C++ connections the GC never frees."""
+    from PySide6.QtCore import QCoreApplication, QEvent
+    from shiboken6 import isValid
+
+    win = _window(qtbot)
+    host = SheetHost(win)
+    shown = _Sheet("Shown")
+    shown.ok.clicked.connect(lambda: shown.setWindowTitle("x"))  # self-capturing closure (cycle)
+    queued = _Sheet("Queued")
+    host.show_sheet(shown)
+    host.show_sheet(queued)
+    finished: list[str] = []
+    queued.finished.connect(lambda: finished.append("queued"))
+    host.close_sheet(queued)  # removed from the queue without ever opening
+    assert finished == ["queued"]
+    host.close_sheet()
+    assert not host.has_sheet()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    assert not isValid(shown) and not isValid(queued)
+    assert not [w for w in QApplication.topLevelWidgets() if isinstance(w, SheetContent)]
+
+
+def test_danger_confirm_sheet_opens_on_cancel(qtbot) -> None:  # type: ignore[no-untyped-def]
+    """Space is the pause key (Focus) and the mark-done key (Habits): one stray press right after
+    "Abandon…" / "Delete…" must cancel, never confirm. Ctrl+Enter still confirms."""
+    win = _window(qtbot)
+    host = SheetHost(win)
+    decided: list[str] = []
+    s = ConfirmSheet("Abandon this session?", "It won't count.", "Abandon", danger=True, cancel_text="Keep going")
+    s.accepted.connect(lambda: decided.append("accepted"))
+    s.rejected.connect(lambda: decided.append("rejected"))
+    host.show_sheet(s)
+    qtbot.waitUntil(lambda: s.cancel_button.hasFocus(), timeout=2000)
+    QTest.keyClick(s.cancel_button, Qt.Key.Key_Space)
+    assert decided == ["rejected"] and not host.has_sheet()
+
+    s2 = ConfirmSheet("Delete ‘Read’?", "This removes its history.", "Delete habit", danger=True)
+    s2.accepted.connect(lambda: decided.append("accepted 2"))
+    host.show_sheet(s2)
+    qtbot.waitUntil(lambda: s2.cancel_button.hasFocus(), timeout=2000)
+    QTest.keyClick(s2.cancel_button, Qt.Key.Key_Return, Qt.KeyboardModifier.ControlModifier)
+    assert decided == ["rejected", "accepted 2"] and not host.has_sheet()
+
+    s3 = ConfirmSheet("Restore this backup?", "", "Restart now")  # not destructive: starts on OK
+    host.show_sheet(s3)
+    qtbot.waitUntil(lambda: s3.ok_button.hasFocus(), timeout=2000)
+    host.close_sheet()
+
+
 def test_sheet_width_attribute() -> None:
     class Wide(SheetContent):
         width = 520  # type: ignore[assignment]  # spec-style int attribute
@@ -441,6 +539,51 @@ def test_toast_single_instance_and_action(qtbot) -> None:  # type: ignore[no-unt
     assert undone == [3] and actioned == [t3] and t3 not in expired
 
 
+def test_toast_undo_runs_on_ctrl_z_but_text_fields_keep_their_undo(qtbot) -> None:  # type: ignore[no-untyped-def]
+    """The toast never takes focus, so its Undo needs a key: Ctrl+Z (⌘Z) while an Undo toast
+    shows — except in a text field, whose own undo wins. The action is a button to screen readers."""
+    from PySide6.QtGui import QAccessible
+
+    win = _window(qtbot)
+    win.activateWindow()
+    qtbot.waitUntil(lambda: QApplication.activeWindow() is win, timeout=2000)
+    host = ToastHost(win)
+    shortcut = host.undo_shortcut()
+    ran: list[str] = []
+    host.show("Exported", "success", "Show", lambda: ran.append("show"))
+    assert not shortcut.isEnabled()  # only an "Undo" action gets the key
+    host.show("Task deleted", "info", "Undo", lambda: ran.append("undo"))
+    assert shortcut.isEnabled() and shortcut.key() == QKeySequence(QKeySequence.StandardKey.Undo)
+    action = host.widget().action
+    assert action.focusPolicy() == Qt.FocusPolicy.NoFocus
+    assert action.accessibleName() == "Undo" and action.accessibleDescription() == f"Shortcut: {host.undo_key_text()}"
+    iface = QAccessible.queryAccessibleInterface(action)
+    assert iface is not None and iface.role() == QAccessible.Role.Button
+
+    edit = win.findChild(QLineEdit)
+    edit.setFocus()
+    QTest.keyClicks(edit, "abc")
+    QTest.keyClick(edit, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+    assert edit.text() != "abc"  # the field undid its typing …
+    assert ran == [] and host.is_showing()  # … and the toast kept its Undo
+
+    edit.clearFocus()
+    QTest.keyClick(win, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+    assert ran == ["undo"] and not host.is_showing() and not shortcut.isEnabled()
+    QTest.mouseClick(action, Qt.MouseButton.LeftButton)  # hidden now: nothing more runs
+    assert ran == ["undo"]
+
+
+def test_toast_action_click_runs_once(qtbot) -> None:  # type: ignore[no-untyped-def]
+    win = _window(qtbot)
+    host = ToastHost(win)
+    ran: list[int] = []
+    host.show("Task deleted", "info", "Undo", lambda: ran.append(1))
+    QApplication.processEvents()
+    QTest.mouseClick(host.widget().action, Qt.MouseButton.LeftButton)
+    assert ran == [1] and not host.is_showing()
+
+
 def test_toast_timeout_and_hover_pause(qtbot) -> None:  # type: ignore[no-untyped-def]
     win = _window(qtbot)
     host = ToastHost(win)
@@ -455,6 +598,41 @@ def test_toast_timeout_and_hover_pause(qtbot) -> None:  # type: ignore[no-untype
     host.show("Bye")
     host.flush()
     assert not host.is_showing()
+
+
+def test_toast_shown_while_hidden_waits_for_the_window(qtbot) -> None:  # type: ignore[no-untyped-def]
+    """E.g. the "finished while Madhura was closed" notice at an autostart into the tray."""
+    win = QWidget()
+    win.resize(800, 600)
+    qtbot.addWidget(win)
+    _KEEP.append(win)
+    host = ToastHost(win)
+    expired: list[int] = []
+    host.expired.connect(expired.append)
+    t = host.show("Your session finished while Madhura was closed.", duration_ms=6000)
+    assert host.is_showing() and host.is_held() and not host._timer.isActive()  # noqa: SLF001
+    win.show()
+    qtbot.waitUntil(lambda: host._timer.isActive(), timeout=1000)  # noqa: SLF001
+    assert not host.is_held() and host._timer.remainingTime() > 5000  # noqa: SLF001 - the full 6 s
+    assert host.widget().isVisible()
+    # Minimized counts as hidden; restoring starts the countdown.
+    win.showMinimized()
+    QApplication.processEvents()
+    if win.isMinimized():  # the platform tracks the state
+        t2 = host.show("Held again")
+        assert expired == [t] and host.is_held()
+        win.showNormal()
+        qtbot.waitUntil(lambda: host._timer.isActive(), timeout=1000)  # noqa: SLF001
+        host.flush()
+        assert expired == [t, t2]
+    # A toast already counting keeps counting when the window goes away (undo commits on time).
+    win.showNormal()
+    QApplication.processEvents()
+    host.show("Deleted — Undo", "info", "Undo", lambda: None)
+    win.hide()
+    QApplication.processEvents()
+    assert host._timer.isActive() and not host.is_held()  # noqa: SLF001
+    host.flush()
 
 
 @pytest.mark.parametrize(("first", "second"), [("dark", "light"), ("light", "dark")])
@@ -497,6 +675,60 @@ def test_popover_open_close(qtbot) -> None:  # type: ignore[no-untyped-def]
     other = win.findChild(QLineEdit)
     QTest.mouseClick(other, Qt.MouseButton.LeftButton)
     assert closed == [1, 1]
+
+
+def test_popover_closes_when_its_anchor_goes_away(qtbot) -> None:  # type: ignore[no-untyped-def]
+    """A page switch (Ctrl+3), the idle/active swap or hiding to the tray hides the anchor's
+    page: the popover must not float on over whatever is shown instead."""
+    from PySide6.QtWidgets import QStackedWidget
+
+    win = _window(qtbot)
+    stack = QStackedWidget(win)
+    win.layout().addWidget(stack)
+    page, other_page = QWidget(), QWidget()
+    stack.addWidget(page)
+    stack.addWidget(other_page)
+    anchor = Button("Custom", parent=page)
+    anchor.move(40, 40)
+    QApplication.processEvents()
+    stepper = Stepper(5, 240, 5, 35, suffix=" min")
+    pop = Popover(anchor, stepper)
+    closed: list[int] = []
+    pop.closed.connect(lambda: closed.append(1))
+    anchor.setFocus(Qt.FocusReason.MouseFocusReason)  # clicked open
+    pop.open()
+    assert stepper.hasFocus()
+    reasons: list[Qt.FocusReason] = []
+    other_page.focusInEvent = lambda e: reasons.append(e.reason())  # type: ignore[method-assign]
+    stack.setCurrentWidget(other_page)  # the page switch hides the anchor's page
+    assert closed == [1] and not pop.isVisible()
+    fw = QApplication.focusWidget()
+    assert fw is stack, fw  # focus left the popover for what remains of the anchor's chain…
+    keyboard = (Qt.FocusReason.TabFocusReason, Qt.FocusReason.BacktabFocusReason)
+    assert not any(r in keyboard for r in reasons)  # …not for the next Tab stop (focus ring)
+    stack.setCurrentWidget(page)
+    pop.open()
+    win.hide()  # hidden to the tray
+    assert closed == [1, 1] and not pop.is_open()
+
+
+def test_popover_follows_its_anchor_on_resize(qtbot) -> None:  # type: ignore[no-untyped-def]
+    from PySide6.QtWidgets import QHBoxLayout
+
+    win = _window(qtbot, 800, 600)
+    row = QHBoxLayout()
+    row.addStretch(1)
+    anchor = Button("Break", parent=win)
+    row.addWidget(anchor)
+    win.layout().addLayout(row)
+    QApplication.processEvents()
+    pop = Popover(anchor, QLabel("Start a 5-min break"), align="right")
+    pop.open()
+    gap = anchor.mapTo(win, anchor.rect().topRight()).x() - pop.geometry().right()
+    win.resize(600, 600)  # the anchor moves 200 px left with the layout
+    qtbot.waitUntil(lambda: anchor.mapTo(win, anchor.rect().topRight()).x() - pop.geometry().right() == gap, timeout=2000)
+    assert pop.is_open()
+    pop.dismiss()
 
 
 # --------------------------------------------------------------------------- dialogs

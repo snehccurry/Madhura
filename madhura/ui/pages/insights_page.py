@@ -78,8 +78,11 @@ log = logging.getLogger(__name__)
 RANGE_OPTIONS: list[tuple[str, str]] = [("7d", "7 days"), ("30d", "30 days"), ("12w", "12 weeks")]
 #: Heatmap and Top projects sit side by side from this window width (else stacked).
 SIDE_BY_SIDE_MIN = 960
-#: KPI cards go 4 across from this content width (else a 2×2 grid, so hints never truncate).
-KPI_FOUR_COLUMNS_MIN = 992
+#: KPI cards go 4 across from this content width (else a 2×2 grid, so hints never truncate). Each
+#: card must fit its label and hint on one row — the widest pair is "FOCUS SCORE" with "Came back
+#: 122 times" (≈ 255 px with the card padding), so 4 × 256 + 3 × 16 gaps. The column is capped at
+#: 1120, so wide windows still get one row.
+KPI_FOUR_COLUMNS_MIN = 1072
 #: Range switch cross-fade.
 FADE_MS = 160
 #: Undo window for "Delete session".
@@ -456,7 +459,7 @@ class _RecentRow(ListRow):
 
     def open_menu(self) -> Menu:
         """Show the ⋯ menu (Delete session)."""
-        menu = Menu(self)
+        menu = Menu(self, delete_on_hide=True)
         menu.add_action("Delete session", lambda: self._on_delete(self.session.id), icon="trash", danger=True)
         self.set_actions_pinned(True)
         menu.aboutToHide.connect(lambda: self.set_actions_pinned(False))
@@ -483,8 +486,11 @@ class _RecentList(KeyboardFocusMixin, QWidget):
         self._ring_radius = 8.0
 
     def set_sessions(self, rows: list[tuple[Session, dict[str, int], str]]) -> None:
-        """Rebuild the rows (session, check-in counts, "when" text)."""
-        keep = self.rows[self._selected].session.id if 0 <= self._selected < len(self.rows) else None
+        """Rebuild the rows (session, check-in counts, "when" text). With keyboard focus the
+        selection stays on its session — or, when that one went away (deleted), on the row that
+        took its place, so a second Delete never jumps to the newest session."""
+        old_index = self._selected
+        keep = self.rows[old_index].session.id if 0 <= old_index < len(self.rows) else None
         for row in self.rows:
             self._layout.removeWidget(row)
             row.hide()
@@ -499,8 +505,9 @@ class _RecentList(KeyboardFocusMixin, QWidget):
         self.empty_label.setVisible(not self.rows)
         ids = [r.session.id for r in self.rows]
         self._selected = -1
+        self.setAccessibleDescription("")
         if keep is not None and self.hasFocus():
-            self.select(ids.index(keep) if keep in ids else min(len(ids) - 1, 0))
+            self.select(ids.index(keep) if keep in ids else min(old_index, len(ids) - 1))
 
     def selected_index(self) -> int:
         """Keyboard-selected row (-1 = none)."""
@@ -510,11 +517,15 @@ class _RecentList(KeyboardFocusMixin, QWidget):
         """Select row *index* (and scroll it into view)."""
         if not self.rows:
             self._selected = -1
+            self.setAccessibleDescription("")
             return
         index = max(0, min(len(self.rows) - 1, index))
         for i, row in enumerate(self.rows):
             row.set_selected(i == index)
         self._selected = index
+        # Focus stays on the list: describe the selected row for assistive tech (a
+        # DescriptionChanged event), e.g. "Today 09:00, Write, 45m, 2 of 12".
+        self.setAccessibleDescription(f"{self.rows[index].accessibleName()}, {index + 1} of {len(self.rows)}")
         scroll = self._scroll_area()
         if scroll is not None:
             scroll.ensureWidgetVisible(self.rows[index], 0, 24)
@@ -537,6 +548,7 @@ class _RecentList(KeyboardFocusMixin, QWidget):
         for row in self.rows:
             row.set_selected(False)
         self._selected = -1
+        self.setAccessibleDescription("")
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
         key = event.key()
@@ -559,7 +571,8 @@ class _RecentList(KeyboardFocusMixin, QWidget):
         if 0 <= self._selected < len(self.rows):
             row = self.rows[self._selected]
             if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
-                self._on_delete(row.session.id)
+                if not event.isAutoRepeat():  # a held key deletes one session, not one per repeat
+                    self._on_delete(row.session.id)
                 event.accept()
                 return
             if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Menu):
@@ -651,6 +664,8 @@ class InsightsPage(PageScroll):
         self.top_toggle.setAccessibleName("Rank by")
         self.top_toggle.valueChanged.connect(self._on_top_mode)
         self.top_card = Card("Top projects", action=self.top_toggle, parent=self.row)
+        # Same header height as the card beside it (its title sits centred next to the toggle).
+        self.heatmap_card.set_header_min_height(self.top_toggle.sizeHint().height())
         self.top_list = HBarList(self.top_card)
         self.top_list.setAccessibleName("Top projects")
         self.top_card.body.addWidget(self.top_list)
@@ -753,7 +768,7 @@ class InsightsPage(PageScroll):
     # ------------------------------------------------------------------ export
     def open_export_menu(self) -> Menu:
         """Show the export menu under the download button."""
-        menu = Menu(self)
+        menu = Menu(self, delete_on_hide=True)
         menu.add_action("Export sessions (CSV)…", self.export_csv, icon="download")
         menu.popup_below(self.export_button, align="right")
         return menu

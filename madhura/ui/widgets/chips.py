@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Sequence
 
-from PySide6.QtCore import QEasingCurve, QEvent, QPoint, QRect, QRectF, QSize, Qt, QVariantAnimation, Signal
-from PySide6.QtGui import QColor, QFontMetrics, QHelpEvent, QKeyEvent, QMouseEvent, QPainter, QPaintEvent
+from PySide6.QtCore import QEasingCurve, QEvent, QPoint, QRect, QRectF, QSize, Qt, QTimer, QVariantAnimation, Signal
+from PySide6.QtGui import QColor, QFocusEvent, QFontMetrics, QHelpEvent, QKeyEvent, QMouseEvent, QPainter, QPaintEvent
 from PySide6.QtWidgets import QAbstractButton, QSizePolicy, QToolTip, QWidget
 
 from madhura.ui import animations, fonts, icons, theme
@@ -415,7 +415,8 @@ class ChipGroup(KeyboardFocusMixin, QWidget):
 class SegmentedControl(KeyboardFocusMixin, QWidget):
     """Segmented picker (e.g. "7 days | 30 days | 12 weeks") with an animated selection pill.
 
-    Emits ``valueChanged(object)`` on user changes only.
+    Emits ``valueChanged(object)`` on user changes only. For options that are expensive to apply
+    (theme), :meth:`set_key_commit_delay` coalesces arrow-key runs into one emission.
     """
 
     valueChanged = Signal(object)
@@ -447,9 +448,20 @@ class SegmentedControl(KeyboardFocusMixin, QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._ring_radius = 8.0
+        self._key_commit_ms = 0
+        self._commit_timer = QTimer(self)
+        self._commit_timer.setSingleShot(True)
+        self._commit_timer.timeout.connect(self._commit)
         self.set_options(options)
         if value is not None:
             self.set_value(value)
+        self._reported = self.value()  # what listeners last heard (emitted or set_value)
+
+    def set_key_commit_delay(self, ms: int) -> None:
+        """Arrow/Home/End keys move the selection at once but emit ``valueChanged`` only after
+        *ms* without another key (Enter/Space, focus-out or hiding emit at once). Clicks always
+        emit at once. 0 (default) emits on every key."""
+        self._key_commit_ms = max(0, int(ms))
 
     def options(self) -> list[tuple[Any, str]]:
         """Current ``(value, label)`` list."""
@@ -464,6 +476,8 @@ class SegmentedControl(KeyboardFocusMixin, QWidget):
         self._indicator = None
         self.setFixedSize(self.sizeHint())
         self.update()
+        self._commit_timer.stop()
+        self._reported = self.value()
 
     def value(self) -> Any:
         """Selected value (None if nothing selected)."""
@@ -472,10 +486,12 @@ class SegmentedControl(KeyboardFocusMixin, QWidget):
         return None
 
     def set_value(self, value: Any) -> None:
-        """Select ``value`` without emitting."""
+        """Select ``value`` without emitting (drops a pending keyboard change)."""
         values = [v for v, _ in self._options]
         if value in values:
+            self._commit_timer.stop()
             self._set_index(values.index(value), emit=False)
+            self._reported = self.value()
 
     def _segment_widths(self) -> list[int]:
         fm = QFontMetrics(self.font())
@@ -519,7 +535,24 @@ class SegmentedControl(KeyboardFocusMixin, QWidget):
             self._anim.setEndValue(QRectF(target))
             self._anim.start()
         if emit:
+            self._commit_timer.stop()
+            self._reported = self.value()
             self.valueChanged.emit(self.value())
+
+    def _key_select(self, index: int) -> None:
+        if self._key_commit_ms <= 0:
+            self._set_index(index, emit=True)
+            return
+        self._set_index(index, emit=False)
+        self._commit_timer.start(self._key_commit_ms)
+
+    def _commit(self) -> None:
+        """Emit a pending keyboard change now (once, and only if the value really changed)."""
+        self._commit_timer.stop()
+        value = self.value()
+        if value != self._reported:
+            self._reported = value
+            self.valueChanged.emit(value)
 
     def _index_at(self, pos: QPoint) -> int:
         for i, r in enumerate(self._segment_rects()):
@@ -555,17 +588,29 @@ class SegmentedControl(KeyboardFocusMixin, QWidget):
         n = len(self._options)
         key = event.key()
         if n and key in (Qt.Key.Key_Left, Qt.Key.Key_Up):
-            self._set_index(max(0, self._index - 1) if self._index >= 0 else 0, emit=True)
+            self._key_select(max(0, self._index - 1) if self._index >= 0 else 0)
         elif n and key in (Qt.Key.Key_Right, Qt.Key.Key_Down):
-            self._set_index(min(n - 1, self._index + 1), emit=True)
+            self._key_select(min(n - 1, self._index + 1))
         elif n and key == Qt.Key.Key_Home:
-            self._set_index(0, emit=True)
+            self._key_select(0)
         elif n and key == Qt.Key.Key_End:
-            self._set_index(n - 1, emit=True)
+            self._key_select(n - 1)
+        elif self._commit_timer.isActive() and key in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._commit()
         else:
             super().keyPressEvent(event)
             return
         event.accept()
+
+    def focusOutEvent(self, event: QFocusEvent) -> None:  # noqa: N802
+        if self._commit_timer.isActive():
+            self._commit()
+        super().focusOutEvent(event)
+
+    def hideEvent(self, event: Any) -> None:  # noqa: N802
+        if self._commit_timer.isActive():
+            self._commit()
+        super().hideEvent(event)
 
     def paintEvent(self, _event: QPaintEvent) -> None:  # noqa: N802
         pal = theme.palette()

@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 from PySide6.QtCore import Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLineEdit
 
 from madhura.context import AppContext, FakeWindowController
@@ -154,6 +155,94 @@ def test_break_skipped_is_silent(focus: AppContext, monkeypatch: pytest.MonkeyPa
     focus.engine.start_break(5)
     focus.engine.skip_break()
     assert played == [] and page_of(focus).is_idle_shown()
+
+
+def _type_next_block(page: FocusPage, text: str) -> None:
+    """Type into the break view's "Next block" field (key events → textEdited), no Enter."""
+    edit = page.active_view.next_field.line_edit
+    edit.setFocus()
+    edit.selectAll()
+    QTest.keyClicks(edit, text)
+
+
+def test_next_block_typed_during_the_break_survives_the_break_running_out(focus: AppContext, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
+    win = win_of(focus)
+    monkeypatch.setattr(win, "is_main_active", lambda: True)
+    focus.repo.add_task("Reply to reviewer", 45, plan_date=TODAY)
+    focus.events.data_changed.emit("tasks")
+    page = page_of(focus)
+    focus.engine.start_break(1)
+    pump()
+    assert page.active_view.next_field.text() == "Reply to reviewer"
+    _type_next_block(page, "Write the migration script")
+    advance(focus, 61, step=30)
+    pump()
+    card = page.idle_view.plan_card
+    assert page.is_idle_shown()
+    assert card.task_field.text() == "Write the migration script"  # not replaced by Up next
+    assert card.minutes() == int(focus.settings.get("default_minutes"))  # as the break's badge said
+    assert card.planned_task_id() is None
+    # The deferred focus lands at the end of the user's text: typing continues it.
+    edit = card.task_field.line_edit
+    assert not edit.hasSelectedText() and edit.cursorPosition() == len(edit.text())
+    # Up next changing afterwards never overwrites it (it isn't a prefill).
+    focus.repo.add_task("Another", 25, plan_date=TODAY)
+    focus.events.data_changed.emit("tasks")
+    pump()
+    assert card.task_field.text() == "Write the migration script"
+    sid = card.start()
+    assert sid is not None and focus.engine.task == "Write the migration script"
+
+
+def test_next_block_draft_on_skip_and_only_when_edited(focus: AppContext) -> None:  # noqa: F811
+    tid = focus.repo.add_task("Reply to reviewer", 45, plan_date=TODAY)
+    focus.events.data_changed.emit("tasks")
+    page = page_of(focus)
+    card = page.idle_view.plan_card
+    # Untouched field → the usual Up next prefill.
+    focus.engine.start_break(5)
+    pump()
+    focus.engine.skip_break()
+    pump()
+    assert card.task_field.text() == "Reply to reviewer" and card.planned_task_id() == tid
+    # Typed, then Skip break → kept.
+    focus.engine.start_break(5)
+    pump()
+    _type_next_block(page, "Draft the agenda")
+    focus.engine.skip_break()
+    pump()
+    assert card.task_field.text() == "Draft the agenda"
+    # The draft isn't sticky: the next untouched break prefills from Up next again.
+    focus.engine.start_break(5)
+    pump()
+    focus.engine.skip_break()
+    pump()
+    assert card.task_field.text() == "Reply to reviewer"
+    # Typed the Up next title itself: its minutes, and starting links the task.
+    focus.engine.start_break(5)
+    pump()
+    _type_next_block(page, "Reply to reviewer")
+    focus.engine.skip_break()
+    pump()
+    assert card.task_field.text() == "Reply to reviewer" and card.minutes() == 45
+    sid = card.start()
+    assert sid is not None and focus.repo.get_session(sid).planned_task_id == tid
+
+
+def test_next_block_started_with_enter_leaves_no_draft(focus: AppContext) -> None:  # noqa: F811
+    focus.repo.add_task("Reply to reviewer", 45, plan_date=TODAY)
+    focus.events.data_changed.emit("tasks")
+    page = page_of(focus)
+    focus.engine.start_break(5)
+    pump()
+    _type_next_block(page, "Inline start")
+    QTest.keyClick(page.active_view.next_field.line_edit, Qt.Key.Key_Return)
+    pump()
+    assert str(focus.engine.state) == "focus" and focus.engine.task == "Inline start"
+    advance(focus, 120)
+    focus.engine.finish()
+    pump()
+    assert page.idle_view.plan_card.task_field.text() == "Reply to reviewer"
 
 
 # =========================================================================== keyboard

@@ -167,3 +167,28 @@ def test_attention_default_sources_and_polling(qtbot, fake_clock, repo) -> None:
     assert not m._timer.isActive()
     quiet_end = fake_clock.now() + timedelta(seconds=1)
     assert quiet_end > fake_clock.now()
+
+
+def test_attention_probe_failures_warn_once(qapp, fake_clock, repo, caplog: pytest.LogCaptureFixture) -> None:
+    """A probe that keeps failing switches 'away'/'busy' off: the first failure must reach the log
+    (INFO level) with its traceback; repeats (every poll) stay at DEBUG."""
+    import logging
+
+    def broken() -> object:
+        raise OSError("probe exploded")
+
+    caplog.set_level(logging.DEBUG, logger="madhura.services.attention")
+    m = AttentionMonitor(fake_clock, repo, system_attention_fn=broken, idle_fn=broken, autostart=False)  # type: ignore[arg-type]
+    try:
+        assert m.state() == "available"
+        m.refresh()
+        m.refresh()
+    finally:
+        m.stop()
+    levels: dict[str, list[int]] = {}
+    for r in caplog.records:
+        levels.setdefault(r.getMessage(), []).append(r.levelno)
+        if r.levelno == logging.WARNING:
+            assert r.exc_info is not None
+    assert levels["System attention probe failed"] == [logging.WARNING, logging.DEBUG, logging.DEBUG]
+    assert levels["Input idle probe failed"] == [logging.WARNING, logging.DEBUG, logging.DEBUG]

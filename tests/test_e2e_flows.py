@@ -495,6 +495,9 @@ def test_full_session_hidden_window_checkins_panel_break_and_pending_sheet(journ
     sheet = j.sheet()
     assert sheet.session_id == sid and sheet.pending
     assert sheet.title_text() == "Session complete"
+    # The break was taken from the panel: the late sheet doesn't offer it (or +15) again.
+    assert not sheet.main_button.isVisible() and not sheet.keep_button.isVisible()
+    assert sheet.primary_button() is sheet.done_button
     sheet.note.set_text("Good flow after the phone break.")
     j.click(sheet.done_button)
     j.wait_until(lambda: not window.has_sheet())
@@ -535,7 +538,7 @@ def test_full_session_active_window_inline_checkins_sheet_break_and_prefill(jour
     j.wait_until(lambda: isinstance(j.sheet(), SessionCompleteSheet))
     sheet = j.sheet()
     assert "completion" not in j.panel_kinds()
-    assert ctx.repo.kv_get(PENDING_KEY) is None
+    assert ctx.repo.kv_get(PENDING_KEY) == sid  # until it's closed: a quit brings it back
     assert sheet.title_text() == "Session complete"
     assert sheet.summary_label.text().startswith("25 of 25 min · 10:00–10:25")
     assert sheet.score_label is not None and sheet.score_label.text() == "3 of 3 focused"
@@ -545,6 +548,7 @@ def test_full_session_active_window_inline_checkins_sheet_break_and_prefill(jour
     assert sheet.main_button.text() == "Take a 10-min break"
     j.click(sheet.main_button)
     j.wait_until(lambda: not window.has_sheet())
+    assert ctx.repo.kv_get(PENDING_KEY) is None
     assert str(ctx.engine.state) == "break" and ctx.engine.break_total_seconds == 10 * 60
     _settle_session(j)
     assert j.active.mode() == "break"
@@ -613,6 +617,44 @@ def test_up_next_item_start_complete_and_mark_done(journey: Journey) -> None:
     assert j.idle.plan_card.task_field.text() == "Write release notes"
     today_rows = j.idle.today_card.rows()
     assert len(today_rows) == 1
+    j.assert_clean()
+
+
+def test_quit_with_the_summary_sheet_open_keeps_the_note_and_asks_again(journey: Journey) -> None:
+    """Ctrl+Q (or shutting the PC down) right after a block, with the summary sheet still up:
+    the note survives, and the sheet comes back next launch for "Mark done" to be confirmed."""
+    from madhura.ui.overlays.session_complete import PENDING_KEY, SessionCompleteSheet
+
+    j = journey
+    j.write_settings(onboarded=True, reduce_motion=True, after_start="stay", checkin_enabled=False)
+    ctx = j.boot()
+    tid = j.idle.up_next.add_task("Write report", 25)
+    assert tid is not None
+    sid = j.idle.up_next.start_task(tid)
+    assert sid is not None
+    j.advance_until(lambda: str(ctx.engine.state) == "idle", 26 * 60, step=30)
+    j.wait_until(lambda: isinstance(j.sheet(), SessionCompleteSheet))
+    sheet = j.sheet()
+    assert sheet.mark_done is not None and sheet.mark_done.isChecked()
+    sheet.note.setFocus()
+    j.qtbot.keyClicks(sheet.note, "Numbers need a second look")
+    j.qtbot.keyClick(j.window, Qt.Key.Key_Q, Qt.KeyboardModifier.ControlModifier)  # quit
+    assert j.quits == 1 and ctx.repo.closed
+
+    # Next morning: the summary is back with the note; nothing was marked done behind the back.
+    ctx = j.restart(after_seconds=14 * 3600)
+    j.wait_until(lambda: isinstance(j.sheet(), SessionCompleteSheet))
+    sheet = j.sheet()
+    assert sheet.session_id == sid and sheet.pending
+    assert sheet.note.text() == "Numbers need a second look"
+    assert ctx.repo.get_session(sid).note == "Numbers need a second look"
+    assert not ctx.repo.get_task(tid).done
+    assert sheet.mark_done is not None and sheet.mark_done.isChecked()
+    assert not sheet.main_button.isVisible()  # no "Take a break" for yesterday's block
+    j.click(sheet.done_button)
+    j.wait_until(lambda: not j.window.has_sheet())
+    assert ctx.repo.get_task(tid).done
+    assert ctx.repo.kv_get(PENDING_KEY) is None
     j.assert_clean()
 
 
@@ -1203,6 +1245,70 @@ def test_idle_away_panel_removes_time_with_the_real_window(journey: Journey, mon
     j.click(panel.remove_button)
     assert before - ctx.engine.focused_seconds >= 8 * 60 - 1
     assert str(ctx.engine.state) == "focus"
+    j.assert_clean()
+
+
+def test_block_ending_while_away_pauses_where_you_left_with_the_away_banner(
+    journey: Journey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    j = journey
+    j.write_settings(onboarded=True, reduce_motion=True, checkin_enabled=False)
+    ctx = j.boot()
+    sid = _lock_in(j, "Review the onboarding copy", 25)
+    j.wait_until(lambda: not j.window.isVisible())
+    # Windows/macOS: 5 minutes at the keyboard, then the PC is locked for lunch.
+    idle = {"s": 0.0}
+    monkeypatch.setattr(ctx.attention, "input_idle_seconds", lambda: idle["s"])
+    j.advance(5 * 60)
+    for _ in range(45 * 6):
+        idle["s"] += 10
+        j.advance(10, 10)
+    engine = ctx.engine
+    assert str(engine.state) == "paused" and engine.session_id == sid  # not "Session complete"
+    assert 5 * 60 - 1 <= engine.focused_seconds <= 5 * 60 + 1
+    assert ctx.repo.get_session(sid).focused_seconds == pytest.approx(5 * 60, abs=1)
+    assert ctx.pill.pill.time_text() == "Paused · were you away?"
+    assert "completion" not in j.panel_kinds()  # no "Nice — 25 min" for a block nobody finished
+
+    idle["s"] = 0.5  # back: open Madhura
+    j.qtbot.mouseDClick(ctx.pill.pill, Qt.MouseButton.LeftButton)
+    j.wait_active()
+    _settle_session(j)
+    page = j.focus_page
+    assert page.away_banner_visible()
+    assert page.away_banner.text() == "You were away 20m"
+    labels = [b.text() for b in page.away_banner.action_buttons()]
+    assert labels == ["Resume", "Finish (save 5 min)", "Abandon"]
+    assert ctx.away.panel is None  # nothing was credited, so nothing to remove
+    j.click(page.away_banner.action_buttons()[1])
+    row = ctx.repo.get_session(sid)
+    assert str(row.outcome) == "ended_early" and row.focused_seconds == pytest.approx(5 * 60, abs=1)
+    j.assert_clean()
+
+
+def test_inline_focusing_back_then_switching_apps_records_the_drift(journey: Journey) -> None:
+    j = journey
+    j.write_settings(onboarded=True, reduce_motion=True, after_start="stay")
+    ctx = j.boot()
+    window = j.window
+    sid = _lock_in(j, "Clean the survey dataset", 45)
+    _settle_session(j)
+    strip = j.active.checkin_strip
+    ck = ctx.checkins
+    j.advance_until(lambda: ck.prompt_mode is not None, 8 * 60)
+    assert ck.prompt_mode == "inline" and strip.phase() == "prompt"
+    j.click(strip.back_button)
+    assert strip.phase() == "reason"
+    window.hide_main()  # straight back to the work app, within the 6 s reason window
+    j.advance(2, 1)
+    assert _records(ctx, sid) == [("drifted", None)]
+    assert ck.prompt_mode is None and ck.popup is None and "checkin" not in j.panel_kinds()
+    assert strip.phase() == "status"
+    # The schedule goes on: the next check-in is a popup, one base interval after the drift.
+    j.advance_until(lambda: ck.prompt_mode is not None, 8 * 60)
+    assert ck.prompt_mode == "popup" and ck.popup.phase() == "question"
+    j.click(ck.popup.focused_button)
+    assert _records(ctx, sid)[-1] == ("focused", None)
     j.assert_clean()
 
 

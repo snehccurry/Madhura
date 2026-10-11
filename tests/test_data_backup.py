@@ -115,3 +115,32 @@ def test_stage_restore_rejects_non_databases(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         backup.stage_restore(other, db_path=tmp_path / "madhura.db")
     assert not (tmp_path / "madhura.db.restore").exists()
+
+
+def test_stage_restore_includes_uncheckpointed_wal(tmp_path: Path) -> None:
+    """A source whose commits still sit in its -wal (copied from a running/crashed app, or a
+    quarantined file) restores with those commits, as one standalone file. The folder name
+    has URI-special characters, which must not break the read-only file: URI."""
+    folder = tmp_path / "copy #2 ?100%"
+    folder.mkdir()
+    source = folder / "madhura.db"
+    src = Repository(source)
+    try:
+        for i in range(5):
+            src.add_habit(f"habit {i}")
+        wal = source.with_name(source.name + "-wal")
+        assert wal.exists() and wal.stat().st_size > 0  # still un-checkpointed
+        live = tmp_path / "live" / "madhura.db"
+        live.parent.mkdir()
+        Repository(live).close()
+        staged = backup.stage_restore(source, db_path=live)
+        assert not staged.with_name(staged.name + "-wal").exists()
+        assert wal.stat().st_size > 0  # the source was only read
+    finally:
+        src.close()
+    assert backup.apply_staged_restore(live)
+    restored = Repository(live)
+    try:
+        assert [h.name for h in restored.habits()] == [f"habit {i}" for i in range(5)]
+    finally:
+        restored.close()

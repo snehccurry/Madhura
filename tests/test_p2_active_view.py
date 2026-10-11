@@ -485,6 +485,25 @@ def test_inline_prompt_shows_and_f_answers(shell: AppContext, view: ActiveView, 
     assert strip.status_label.text() == "Check-ins: 1 focused · next in ~7 min"
 
 
+def test_inline_confirmation_never_promises_a_check_in_that_cannot_fire(shell: AppContext, view: ActiveView) -> None:  # noqa: F811
+    """25-min block answered at 21:00 with the next check-in 7 min away: only 4 min are left,
+    so — like the popup and the status line — no "next check-in" is promised."""
+    ck = fake(shell)
+    shell.settings.update(checkin_enabled=False)  # the real service (still alive) stays quiet
+    shell.engine.start("Write the report", 25)
+    advance(shell, 21 * 60, step=30)
+    assert 230 < shell.engine.remaining_seconds <= 240
+    ck.prompt_inline.emit()
+    view.checkin_strip.answer_focused()
+    assert view.checkin_strip.confirm_label.text() == "✓ Nice — keep going"
+    view.checkin_strip._end_confirm()  # noqa: SLF001
+    # Plenty of block left → announced as before.
+    ck.next_in = 120.0
+    ck.prompt_inline.emit()
+    view.checkin_strip.answer_focused()
+    assert view.checkin_strip.confirm_label.text() == "✓ Nice — next check-in in ~2 min"
+
+
 def test_first_prompt_ever_shows_the_intro_once(shell: AppContext, view: ActiveView) -> None:  # noqa: F811
     ck = fake(shell)
     shell.engine.start("Write", 30)
@@ -750,3 +769,24 @@ def test_title_wraps_balanced_and_clamps_to_two_lines(qapp: QApplication) -> Non
 
 def test_strip_is_a_public_widget(shell: AppContext, view: ActiveView) -> None:  # noqa: F811
     assert isinstance(view.checkin_strip, CheckInStrip)
+
+
+def test_shortcut_tooltips_use_the_platform_modifier(shell: AppContext, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
+    """QShortcut("Ctrl+H") is ⌘H on macOS: the tooltips say so (as the shortcuts sheet does)."""
+    from types import SimpleNamespace
+
+    from madhura.ui import shortcuts_sheet
+
+    monkeypatch.setattr(shortcuts_sheet, "sys", SimpleNamespace(platform="darwin"))
+    v = ActiveView(shell)
+    try:
+        assert v.finish_button.toolTip() == "Finish · ⌘+Shift+F"
+        assert v.hide_button.toolTip() == "Hide to mini timer · ⌘+H"
+        assert v.break_hide_button.toolTip() == "Hide to mini timer · ⌘+H"
+        assert v.hide_button.accessibleName() == "Hide to mini timer"
+    finally:
+        v.deleteLater()
+    monkeypatch.setattr(shortcuts_sheet, "sys", SimpleNamespace(platform="win32"))
+    v = ActiveView(shell)
+    assert v.hide_button.toolTip() == "Hide to mini timer · Ctrl+H"
+    v.deleteLater()

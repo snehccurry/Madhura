@@ -187,6 +187,41 @@ def test_completers_and_project_dot(focus: AppContext) -> None:  # noqa: F811
     assert card.project_field.text() == "Work"
 
 
+def test_keyboard_pick_from_the_completer_keeps_the_remembered_project(focus: AppContext) -> None:  # noqa: F811
+    """Typing "deep", ↓, Enter: the session starts with the past task's project, as a mouse pick
+    would (QLineEdit starts the session before the completer's ``activated`` fires)."""
+    add_session(focus, "Deep work on parser", datetime(2026, 10, 13, 9, 0), 30, project="Compiler")
+    card = _card(focus)
+    card.refresh_completers()
+    edit = card.task_field.line_edit
+    win_of(focus).activateWindow()
+    edit.setFocus()
+    QTest.keyClicks(edit, "deep")
+    pump()
+    popup = edit.completer().popup()
+    assert popup.isVisible()
+    QTest.keyClick(popup, Qt.Key.Key_Down)  # keys go to the open popup, as on a real desktop
+    QTest.keyClick(popup, Qt.Key.Key_Return)
+    pump()
+    e = focus.engine
+    assert str(e.state) == "focus" and e.task == "Deep work on parser"
+    assert e.project == "Compiler"
+    assert card.project_field.text() == ""  # no stale project left behind for the next block
+
+
+def test_cleared_project_after_a_completer_pick_stays_cleared(focus: AppContext) -> None:  # noqa: F811
+    add_session(focus, "Deep work on parser", datetime(2026, 10, 13, 9, 0), 30, project="Compiler")
+    card = _card(focus)
+    card.refresh_completers()
+    card._on_title_highlighted("Deep work on parser")  # noqa: SLF001 - mouse hover, then click
+    card.task_field.set_text("Deep work on parser")
+    card._on_title_completed("Deep work on parser")  # noqa: SLF001
+    assert card.project_field.text() == "Compiler"
+    card.project_field.set_text("")  # the user doesn't want a project this time
+    card.start()
+    assert focus.engine.project is None
+
+
 def test_project_completer_suggests_projects(focus: AppContext) -> None:  # noqa: F811
     add_session(focus, "Write report", datetime(2026, 10, 13, 9, 0), 30, project="Writing")
     card = _card(focus)
@@ -381,6 +416,50 @@ def test_delete_key_and_replacement_toast_commits(focus: AppContext) -> None:  #
     assert repo.get_task(a) is not None and up.list.selected_id() == b
     win.show_toast("Something else")  # replaces the undo toast → commit
     assert repo.get_task(a) is None
+
+
+def test_held_delete_key_deletes_one_task(focus: AppContext) -> None:  # noqa: F811
+    """Auto-repeat of a held Delete / Backspace is ignored (each repeat would commit the
+    previous delete by replacing its undo toast)."""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+
+    repo = focus.repo
+    a = repo.add_task("One", plan_date=TODAY)
+    b = repo.add_task("Two", plan_date=TODAY)
+    c = repo.add_task("Three", plan_date=TODAY)
+    focus.events.data_changed.emit("tasks")
+    up = _up(focus)
+    up.list.setFocus()
+    up.list.select_id(a)
+    key(up.list, Qt.Key.Key_Delete)
+    assert up.list.selected_id() == b
+    for k in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+        QApplication.sendEvent(up.list, QKeyEvent(QEvent.Type.KeyPress, k, Qt.KeyboardModifier.NoModifier, "", True))
+    assert [t.id for t in up.tasks()] == [b, c] and up.list.selected_id() == b
+    assert repo.get_task(a) is not None  # still undoable
+
+
+def test_keyboard_selection_is_described_for_assistive_tech(focus: AppContext) -> None:  # noqa: F811
+    repo = focus.repo
+    repo.add_task("Reply to reviewer", 25, plan_date=TODAY)
+    b = repo.add_task("Write the report", 45, plan_date=TODAY)
+    c = repo.add_task("Read", 15, plan_date=TODAY)
+    repo.set_task_done(c, True)
+    focus.events.data_changed.emit("tasks")
+    up = _up(focus)
+    assert up.list.accessibleName() == "Up next tasks" and up.list.accessibleDescription() == ""
+    up.list.setFocus(Qt.FocusReason.TabFocusReason)
+    pump()
+    assert up.list.accessibleDescription() == "Reply to reviewer, 25 min, 1 of 3"
+    key(up.list, Qt.Key.Key_Down)
+    assert up.list.selected_id() == b
+    assert up.list.accessibleDescription() == "Write the report, 45 min, 2 of 3"
+    key(up.list, Qt.Key.Key_End)
+    assert up.list.accessibleDescription() == "Read, 15 min, done, 3 of 3"
+    win_of(focus).pages["focus"].idle_view.plan_card.task_field.line_edit.setFocus()
+    pump()
+    assert up.list.accessibleDescription() == ""
 
 
 def test_reorder_with_alt_arrows(focus: AppContext) -> None:  # noqa: F811
@@ -618,6 +697,48 @@ def test_parking_lot_to_up_next_and_undo(focus: AppContext) -> None:  # noqa: F8
     assert focus.repo.tasks_for_date(TODAY) == [] and [c.id for c in focus.repo.open_captures()] == [cid]
 
 
+def test_rows_are_updated_in_place_not_rebuilt(focus: AppContext) -> None:  # noqa: F811
+    """A done toggle / one cleared capture touches only what changed (no full rebuild)."""
+    repo = focus.repo
+    ids = [repo.add_task(f"Task {i}", 25, plan_date=TODAY) for i in range(5)]
+    caps = [repo.add_capture(f"Thought {i}") for i in range(6)]
+    focus.events.data_changed.emit("tasks")
+    focus.events.data_changed.emit("captures")
+    pump()
+    up = _up(focus)
+    before = {r.task.id: r for r in up.list.rows}
+    up.toggle_done(ids[1])
+    pump()
+    after = {r.task.id: r for r in up.list.rows}
+    assert all(after[i] is before[i] for i in ids)  # the same widgets, updated
+    assert [r.task.id for r in up.list.rows] == [ids[0], ids[2], ids[3], ids[4], ids[1]]  # done sank
+    done = after[ids[1]]
+    assert done.check.isChecked() and not done.start_button.isEnabled()
+    assert done.title.property("tone") == "muted"
+    assert up.list._layout.count() == 5  # noqa: SLF001 - laid out once each, nothing left over
+    # Edits show up in place too.
+    repo.update_task(ids[0], title="Renamed", minutes=45)
+    focus.events.data_changed.emit("tasks")
+    pump()
+    row = up.row_for(ids[0])
+    assert row is before[ids[0]]
+    assert row.title.full_text() == "Renamed" and row.minutes_badge.text() == "45m"
+    assert row.start_button.accessibleName() == "Start ‘Renamed’"
+    up.toggle_done(ids[1])  # back to unfinished
+    pump()
+    assert not up.row_for(ids[1]).check.isChecked() and up.row_for(ids[1]).start_button.isEnabled()
+    assert up.row_for(ids[1]).title.property("tone") in ("", None)
+    # Parking lot: clearing one capture keeps every other row.
+    lot = page_of(focus).idle_view.parking_lot
+    rows = {r.capture.id: r for r in lot.rows()}
+    lot.clear_capture(caps[2])
+    pump()
+    left = {r.capture.id: r for r in lot.rows()}
+    assert set(left) == set(caps) - {caps[2]}
+    assert all(left[c] is rows[c] for c in left)
+    assert lot.count_label.text() == "5"
+
+
 def test_parking_lot_action_shows_on_hover(focus: AppContext) -> None:  # noqa: F811
     from PySide6.QtCore import QEvent, QPointF
     from PySide6.QtGui import QEnterEvent
@@ -724,6 +845,15 @@ def test_two_columns_when_wide_and_single_column_when_narrow(focus: AppContext) 
     assert idle.is_two_columns()
 
 
+def test_side_by_side_card_titles_share_a_baseline(focus: AppContext) -> None:  # noqa: F811
+    idle = page_of(focus).idle_view
+    show(focus, 1120, 760)
+    assert idle.is_two_columns()
+    plan = idle.plan_card.heading
+    today = idle.today_card._title  # noqa: SLF001
+    assert plan.mapTo(idle.column, QPoint(0, 0)).y() == today.mapTo(idle.column, QPoint(0, 0)).y()
+
+
 def test_plan_card_controls_reflow(focus: AppContext) -> None:  # noqa: F811
     card = _card(focus)
     show(focus, 1120, 760)
@@ -788,6 +918,38 @@ def test_weekly_recap_embedding(qapp, data_dir, fake_clock, monkeypatch, no_summ
         assert not idle.recap.isVisible()
     finally:
         dispose_shell(ctx, qapp)
+
+
+def test_weekly_recap_returns_next_week_after_a_dismiss(focus: AppContext) -> None:  # noqa: F811
+    """Tray-resident app running across weeks: a dismiss hides this week's recap only."""
+    from madhura.ui.widgets.recap import SEEN_KEY
+
+    add_session(focus, "Last week", datetime(2026, 10, 6, 9, 0), 120)  # week of Mon 5 Oct
+    idle = page_of(focus).idle_view
+    idle.refresh()
+    pump()
+    assert idle.recap is not None and idle.recap.isVisible()
+    idle.recap.dismiss()
+    pump()
+    assert not idle.recap.isVisible()
+    # Same week, next day: stays dismissed.
+    focus.clock.advance(24 * 3600)  # type: ignore[attr-defined]
+    focus.events.day_changed.emit()
+    pump()
+    assert not idle.recap.isVisible()
+    # Next Monday, with focus in the (now) previous week: the new recap shows.
+    add_session(focus, "This week", datetime(2026, 10, 14, 9, 0), 90)
+    focus.clock.advance(4 * 24 * 3600)  # type: ignore[attr-defined] - Mon 19 Oct
+    focus.events.day_changed.emit()
+    pump()
+    assert idle.recap.isVisible()
+    assert focus.repo.kv_get(SEEN_KEY) == "2026-W43"
+    assert "1h 30m" in idle.recap.text()
+    # Another day in that week with the card still up: it stays.
+    focus.clock.advance(24 * 3600)  # type: ignore[attr-defined]
+    focus.events.day_changed.emit()
+    pump()
+    assert idle.recap.isVisible()
 
 
 def test_idle_view_accessibility_names(focus: AppContext) -> None:  # noqa: F811

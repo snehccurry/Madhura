@@ -45,15 +45,17 @@ except ImportError:  # pragma: no cover
         return True
 
 
-__all__ = ["SheetHost", "SheetContent", "ConfirmSheet", "SHEET_RADIUS", "SHEET_WIDTH", "FLOATING_PROP"]
+__all__ = ["SheetHost", "SheetContent", "ConfirmSheet", "SHEET_RADIUS", "SHEET_WIDTH", "FLOATING_PROP", "inside_floating"]
 
 SHEET_RADIUS = 16.0
 SHEET_WIDTH = 440
 _CARD_MARGIN = 24  # shadow margin around the sheet card
+_SCROLLBAR_INSET = 4  # gap between the body's scrollbar and the card's right border
 FLOATING_PROP = "mh_floating"  # widgets (popovers) exempt from the sheet focus trap
 
 
-def _inside_floating(w: QWidget | None) -> bool:
+def inside_floating(w: QWidget | None) -> bool:
+    """True if *w* is (inside) a floating in-window widget such as a :class:`Popover`."""
     while w is not None:
         if w.property(FLOATING_PROP):
             return True
@@ -80,7 +82,9 @@ class SheetContent(QWidget):
     Helpers: :meth:`set_title` (title + optional subtitle), :attr:`body` (QVBoxLayout),
     :attr:`footer` (right-aligned QHBoxLayout; :attr:`footer_left` for left items),
     :meth:`add_footer_button`, :meth:`set_primary` (Ctrl+Enter), :meth:`close_sheet`.
-    ``finished`` is emitted once the sheet has closed (however it was closed).
+    ``finished`` is emitted once the sheet has closed (however it was closed); a sheet closed by
+    its :class:`SheetHost` is deleted afterwards (``deleteLater``), so show a fresh one each time
+    and don't touch it from callbacks that may run later (e.g. a toast's Undo).
     """
 
     finished = Signal()
@@ -251,6 +255,12 @@ class _SheetCard(QWidget):
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll.viewport().setAutoFillBackground(False)
         self.scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # Keep the scrollbar clear of the card: off the right border and below the rounded
+        # top-right corner (the bottom is always the pinned footer when the body scrolls). The
+        # bar keeps its 10 px width — the pinned footer's right padding is based on it.
+        self.scroll.verticalScrollBar().setStyleSheet(
+            f"QScrollBar:vertical {{ margin: {int(SHEET_RADIUS)}px {_SCROLLBAR_INSET}px 8px 0px; }}"
+        )
         lay.addWidget(self.scroll)
         #: Pinned footer slot (see :meth:`SheetContent._pin_footer`).
         self.footer_holder = QVBoxLayout()
@@ -372,6 +382,7 @@ class SheetHost(QWidget):
             self._queue.remove(content)
             content._host = None  # noqa: SLF001
             content.finished.emit()
+            content.deleteLater()  # see _finish_close
             return
         if self._current is None or self._closing:
             return
@@ -451,6 +462,11 @@ class SheetHost(QWidget):
         if content is not None and _is_valid(content):
             content.finished.emit()
             self.sheetClosed.emit(content)
+            # A closed sheet is never shown again (every caller builds a fresh one). Without this
+            # it would live on as a hidden, parentless window — sheets whose closures capture
+            # them form reference cycles through C++ connections that Python's GC can't break —
+            # and every later theme change would re-polish its whole widget tree.
+            content.deleteLater()
         if self._queue:
             self._open(self._queue.pop(0))
             return
@@ -542,7 +558,7 @@ class SheetHost(QWidget):
         fw = QApplication.focusWidget()
         if fw is not None and fw.window() is not self.window():
             return False
-        if fw is not None and _inside_floating(fw):
+        if fw is not None and inside_floating(fw):
             return False
         key = event.key()
         content = self._current
@@ -599,7 +615,7 @@ class SheetHost(QWidget):
     def _on_focus_changed(self, _old: QWidget | None, new: QWidget | None) -> None:
         if self._current is None or new is None or not self.isVisible():
             return
-        if new.window() is not self.window() or self.isAncestorOf(new) or _inside_floating(new):
+        if new.window() is not self.window() or self.isAncestorOf(new) or inside_floating(new):
             return
         items = self._focusables()
         if items:
@@ -652,7 +668,8 @@ class SheetHost(QWidget):
 
 
 class ConfirmSheet(SheetContent):
-    """Standard confirmation: title, text, Cancel + OK (``danger`` → solid danger button).
+    """Standard confirmation: title, text, Cancel + OK (``danger`` → solid danger button, and
+    the sheet opens with Cancel focused).
 
     ``type_to_confirm`` (e.g. "reset") requires typing that word before OK enables.
     Emits ``accepted`` or ``rejected`` exactly once.
@@ -678,6 +695,7 @@ class ConfirmSheet(SheetContent):
         self._decided = False
         self._accepted = False
         self._phrase = type_to_confirm
+        self._danger = bool(danger)
         self.set_title(title)
         self.text_label = QLabel(text, self)
         self.text_label.setWordWrap(True)
@@ -744,5 +762,7 @@ class ConfirmSheet(SheetContent):
     def initial_focus_widget(self) -> QWidget | None:
         if self.confirm_field is not None:
             return self.confirm_field.line_edit
-        return self.ok_button
+        # A destructive confirmation starts on Cancel: Space (pause on the Focus page, "done" on
+        # Habits) or Enter pressed out of habit must never confirm it. Ctrl+Enter still does.
+        return self.cancel_button if self._danger else self.ok_button
 

@@ -1,7 +1,9 @@
 """Launch-at-login integration (spec §1.10 System, §1.11 onboarding).
 
 * **Windows** — value ``Madhura`` under ``HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run``:
-  ``"<exe>" --autostart`` when frozen, else ``"<pythonw.exe next to python>" -m madhura --autostart``.
+  ``"<exe>" --autostart`` when frozen; ``"<pythonw.exe next to python>" -m madhura --autostart`` when
+  installed into site-packages; from a source checkout, ``"<pythonw.exe>" -c "<SOURCE_BOOTSTRAP>"
+  "<checkout>" --autostart`` (Run entries start in System32, where ``-m madhura`` can't find it).
   The user can switch the entry off in Task Manager / Settings › Apps › Startup; Windows records
   that in ``…\\Explorer\\StartupApproved\\Run`` (first byte odd, e.g. ``0x03`` = disabled), which
   :func:`status` reports as ``"disabled_by_os"``.
@@ -20,7 +22,7 @@ import logging
 import ntpath
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import MutableMapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +40,8 @@ __all__ = [
     "set_enabled",
     "launch_command",
     "relaunch_command",
+    "prepare_relaunch_environment",
+    "SOURCE_BOOTSTRAP",
     "pythonw_path",
     "windows_command",
     "windows_status",
@@ -63,6 +67,12 @@ AUTOSTART_FLAG = "--autostart"
 _IS_WINDOWS = sys.platform == "win32"
 _IS_LINUX = sys.platform.startswith("linux")
 
+#: ``python -c`` program that runs Madhura from a source checkout whatever the current folder is: the
+#: checkout comes in as the first argument (never pasted into the source, so no path can break the
+#: quoting) and goes first on ``sys.path``; the rest of argv is Madhura's. Kept short: Windows
+#: documents Run-key command lines as at most 260 characters.
+SOURCE_BOOTSTRAP = "import sys;sys.path.insert(0,sys.argv.pop(1));from madhura.app import main;sys.exit(main())"
+
 
 # =========================================================================== commands
 
@@ -76,15 +86,26 @@ def pythonw_path(executable: str) -> str:
     return ntpath.join(ntpath.dirname(executable), "pythonw.exe")
 
 
-def windows_command(executable: str, frozen: bool, *, use_pythonw: bool = True) -> str:
+def _win_quote(arg: str) -> str:
+    """*arg* double-quoted for a Windows command line. Paths can't contain ``"``; trailing
+    backslashes are doubled so ``C:\\`` doesn't escape the closing quote."""
+    trailing = len(arg) - len(arg.rstrip("\\"))
+    return '"' + arg + "\\" * trailing + '"'
+
+
+def windows_command(executable: str, frozen: bool, *, use_pythonw: bool = True, source_root: str | None = None) -> str:
     """The Run-key command line.
 
-    Frozen: ``"<exe>" --autostart``. From source: ``"<pythonw.exe next to exe>" -m madhura
-    --autostart`` (or *executable* itself when ``use_pythonw`` is False, e.g. pythonw is missing).
+    Frozen: ``"<exe>" --autostart``. Otherwise the interpreter (``pythonw.exe`` next to *executable*,
+    or *executable* itself when ``use_pythonw`` is False, e.g. pythonw is missing) with
+    ``-m madhura --autostart``, or — for a source checkout at *source_root* —
+    ``-c "<SOURCE_BOOTSTRAP>" "<source_root>" --autostart``.
     """
     if frozen:
         return f'"{executable}" {AUTOSTART_FLAG}'
     interpreter = pythonw_path(executable) if use_pythonw else executable
+    if source_root:
+        return f'"{interpreter}" -c "{SOURCE_BOOTSTRAP}" {_win_quote(source_root)} {AUTOSTART_FLAG}'
     return f'"{interpreter}" -m madhura {AUTOSTART_FLAG}'
 
 
@@ -94,25 +115,75 @@ def _windows_interpreter() -> str:
     return candidate if os.path.exists(candidate) else exe
 
 
+def _same_dir(a: str | os.PathLike[str], b: str | os.PathLike[str]) -> bool:
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
+def _source_root() -> str | None:
+    """The folder holding the ``madhura`` package, which commands then put on ``sys.path``
+    themselves; None when frozen or installed into site-packages (``-m madhura`` works anywhere).
+    Anywhere else — a source checkout — ``-m madhura`` only works from inside that folder."""
+    if _frozen():
+        return None
+    import site
+
+    from madhura import paths
+
+    root = paths.repo_root()
+    try:
+        site_dirs = list(site.getsitepackages())
+        if site.ENABLE_USER_SITE:
+            site_dirs.append(site.getusersitepackages())
+    except AttributeError:  # pragma: no cover - very old virtualenv site.py
+        site_dirs = []
+    if any(_same_dir(root, d) for d in site_dirs if d):
+        return None
+    return str(root)
+
+
+def _module_args(source_root: str | None) -> list[str]:
+    """Interpreter arguments that run Madhura: ``-m madhura``, or the checkout bootstrap."""
+    return ["-c", SOURCE_BOOTSTRAP, source_root] if source_root else ["-m", "madhura"]
+
+
 def launch_command() -> list[str]:
-    """argv used to start Madhura at login on this OS (frozen exe, or the interpreter + ``-m madhura``)."""
+    """argv used to start Madhura at login on this OS: the frozen exe, or the interpreter running
+    ``-m madhura`` (Linux sets the entry's working folder instead; Windows can't, so a checkout
+    there gets :data:`SOURCE_BOOTSTRAP`)."""
     if _frozen():
         return [sys.executable, AUTOSTART_FLAG]
-    interpreter = _windows_interpreter() if _IS_WINDOWS else sys.executable
-    return [interpreter, "-m", "madhura", AUTOSTART_FLAG]
+    if _IS_WINDOWS:
+        return [_windows_interpreter(), *_module_args(_source_root()), AUTOSTART_FLAG]
+    return [sys.executable, "-m", "madhura", AUTOSTART_FLAG]
 
 
 def relaunch_command(argv: Sequence[str] | None = None) -> list[str]:
     """argv that restarts Madhura in the foreground (e.g. after staging a restore).
 
     Keeps the user's extra arguments but drops ``--autostart`` / ``--minimized`` so the window
-    shows after the restart.
+    shows after the restart. A source checkout is found whatever the current folder is (it is
+    System32 when Windows started Madhura at login).
     """
     args = list(sys.argv if argv is None else argv)[1:]
     extra = [a for a in args if a not in (AUTOSTART_FLAG, "--minimized")]
     if _frozen():
         return [sys.executable, *extra]
-    return [sys.executable, "-m", "madhura", *extra]
+    return [sys.executable, *_module_args(_source_root()), *extra]
+
+
+def prepare_relaunch_environment(environ: MutableMapping[str, str]) -> None:
+    """Let a frozen build start itself again as a fresh instance (no-op from source).
+
+    A PyInstaller onefile child would otherwise pass its bootloader variables on, and the new
+    process would reuse this one's extraction folder — which is deleted as this process exits.
+    PyInstaller >= 6.10 honours ``PYINSTALLER_RESET_ENVIRONMENT``; older bootloaders look for
+    ``_MEIPASS2`` / ``_PYI_*``, so those go too.
+    """
+    if not _frozen():
+        return
+    for name in [k for k in environ if k.upper() == "_MEIPASS2" or k.upper().startswith("_PYI_")]:
+        environ.pop(name, None)
+    environ["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
 
 
 def commands_equal(a: str | None, b: str | None) -> bool:
@@ -167,7 +238,7 @@ def _expected_windows_command() -> str:
     exe = sys.executable
     if _frozen():
         return windows_command(exe, True)
-    return windows_command(exe, False, use_pythonw=os.path.exists(pythonw_path(exe)))
+    return windows_command(exe, False, use_pythonw=os.path.exists(pythonw_path(exe)), source_root=_source_root())
 
 
 def _windows_status() -> str:

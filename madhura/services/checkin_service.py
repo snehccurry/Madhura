@@ -11,8 +11,13 @@ never advances it). When a check-in is due:
   and answers through :meth:`answer`); otherwise a :class:`CheckInPopup` in the popup stack.
 
 The open prompt times out after ``checkin_timeout_seconds`` of clock time (hovering the popup
-pauses it, resuming with ≥ 10 s) → 'missed'. Two consecutive misses pause the session at the
-fire time of the first one. Pausing or ending the session closes an open prompt without a record.
+pauses it, resuming with ≥ 10 s) → 'missed'. Once "Focusing back" is chosen the answer is
+'drifted': the reason step answers itself after 6 s, and the service records it anyway if that
+step goes away (inline prompt left behind) or never finishes. Two consecutive misses pause the
+session at the fire time of the first one. Whenever focused time moves backwards (that pause,
+removed away time, an away/sleep pause) the schedule restarts one interval from it
+(:meth:`CheckInService.reanchor`). Pausing or ending the session closes an open prompt without a
+record.
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ __all__ = [
     "IDLE_SUPPRESS_SECONDS",
     "DEFER_RETEST_MS",
     "HOVER_RESUME_SECONDS",
+    "REASON_FALLBACK_SECONDS",
 ]
 
 log = logging.getLogger(__name__)
@@ -47,6 +53,9 @@ RESPONSES = ("focused", "drifted", "missed")
 IDLE_SUPPRESS_SECONDS = 300.0
 DEFER_RETEST_MS = 15_000
 HOVER_RESUME_SECONDS = 10.0
+#: "Focusing back" chosen: record 'drifted' if the reason step hasn't answered by then (it answers
+#: itself after 6 s; hovering the popup holds this too).
+REASON_FALLBACK_SECONDS = 16.0
 #: Attention states that defer a due check-in.
 _DEFER_STATES = ("busy", "quiet", "away")
 
@@ -62,7 +71,7 @@ class _Prompt:
     timeout: float
     deadline: float
     hover_left: float | None = None  # seconds left, frozen while the popup is hovered
-    answering: bool = False  # "Focusing back" chosen in the popup: no timeout any more
+    answering: bool = False  # "Focusing back" chosen: 'drifted' by the reason step or the fallback
 
 
 class CheckInService(QObject):
@@ -70,8 +79,8 @@ class CheckInService(QObject):
 
     Signals: ``prompt_inline`` (Focus page: show the inline prompt), ``prompt_closed`` (hide an
     unanswered inline prompt), ``answered(response)`` (after every recorded answer, including
-    'missed'). Extensions: ``auto_paused`` (two misses paused the session) and
-    ``prompt_opened(mode)`` ("inline" | "popup").
+    'missed'). Extensions: ``auto_paused`` (two misses paused the session),
+    ``prompt_opened(mode)`` ("inline" | "popup") and :meth:`reanchor`.
     """
 
     prompt_inline = Signal()
@@ -100,6 +109,7 @@ class CheckInService(QObject):
         engine.session_started.connect(self._on_session_started)
         engine.state_changed.connect(self._on_state_changed)
         engine.tick.connect(self.evaluate)
+        engine.away_detected.connect(lambda _gap: self.reanchor())
         s.changed.connect(self._on_setting)
         ctx.attention.changed.connect(self._on_attention)
         if engine.is_active and engine.session_id is not None:
@@ -124,8 +134,7 @@ class CheckInService(QObject):
         self._record(sid, response, reason or None)
         self._planner.record(response)
         if response != "missed":
-            self._misses = 0
-            self._first_miss_epoch = None
+            self._reset_misses()
         self.answered.emit(response)
 
     def counts(self) -> dict:
@@ -193,9 +202,10 @@ class CheckInService(QObject):
         return self._seconds_left(self._prompt) if self._prompt is not None else None
 
     def set_prompt_hover(self, hovered: bool) -> None:
-        """The popup is hovered: freeze the timeout; on leave resume with at least 10 s."""
+        """The popup is hovered: freeze the timeout (or the reason fallback); on leave resume with
+        at least 10 s."""
         p = self._prompt
-        if p is None or p.answering:
+        if p is None:
             return
         now = self._ctx.clock.time()
         if hovered:
@@ -206,10 +216,23 @@ class CheckInService(QObject):
             p.hover_left = None
 
     def begin_reason(self) -> None:
-        """"Focusing back" was chosen in the popup: the answer is drifted, stop the timeout."""
-        if self._prompt is not None:
-            self._prompt.answering = True
-            self._prompt.hover_left = None
+        """"Focusing back" was chosen: the answer is drifted. The timeout no longer applies; the
+        reason step answers, or :data:`REASON_FALLBACK_SECONDS` later the service does."""
+        p = self._prompt
+        if p is not None and not p.answering:
+            p.answering = True
+            p.hover_left = None
+            p.deadline = self._ctx.clock.time() + REASON_FALLBACK_SECONDS
+
+    def reanchor(self) -> None:
+        """Focused time moved backwards (a retroactive pause, removed away time, an away/sleep
+        pause): plan the next check-in one full interval from the current focused time."""
+        engine = self._ctx.engine
+        if not engine.is_active or engine.session_id is None:
+            return
+        self._sid = engine.session_id
+        self._planner.reset(engine.focused_seconds)
+        self._set_deferred(False)
 
     def fire_now(self) -> bool:
         """Present a check-in immediately (ignores timing; still needs a focusing session)."""
@@ -323,15 +346,23 @@ class CheckInService(QObject):
         if p is None:
             return
         if p.mode == "inline" and not self._inline_possible():
+            if p.answering:
+                # "Focusing back" was already chosen on the Focus page: the answer is drifted.
+                # Record it (the strip drops its reason step on ``answered``), don't ask again.
+                self.answer("drifted")
+                return
             # The window went away mid-question: carry the same prompt over to a popup.
             self.prompt_closed.emit()
             p.mode = "popup"
             self._show_popup()
             return
-        if p.answering or p.hover_left is not None:
+        if p.hover_left is not None:
             return
         if self._ctx.clock.time() >= p.deadline:
-            self._on_timeout()
+            if p.answering:
+                self.answer("drifted")  # the reason step never answered: still a drift
+            else:
+                self._on_timeout()
 
     def _seconds_left(self, p: _Prompt) -> float:
         if p.hover_left is not None:
@@ -356,18 +387,29 @@ class CheckInService(QObject):
             return
         self._record(p.session_id, "missed", None)
         self._planner.record("missed")
-        self._misses += 1
-        if self._misses == 1:
-            self._first_miss_epoch = p.fired_epoch
         self.answered.emit("missed")
-        if self._misses >= 2 and str(engine.state) == "focus":
-            at = self._first_miss_epoch if self._first_miss_epoch is not None else p.fired_epoch
-            self._misses = 0
-            self._first_miss_epoch = None
-            self._miss_pause_sid = p.session_id
-            log.info("Two check-ins missed in a row; pausing the session retroactively")
-            engine.pause(at=at)
-            self.auto_paused.emit()
+        self._note_miss(p.session_id, p.fired_epoch)
+
+    def _note_miss(self, session_id: int, fired_epoch: float) -> None:
+        """Count a miss; the second in a row pauses the session at the first one's fire time
+        (retroactively) and restarts the schedule from there."""
+        self._misses += 1
+        if self._first_miss_epoch is None:
+            self._first_miss_epoch = fired_epoch
+        engine = self._ctx.engine
+        if self._misses < 2 or str(engine.state) != "focus" or engine.session_id != session_id:
+            return
+        at = self._first_miss_epoch
+        self._reset_misses()
+        self._miss_pause_sid = session_id
+        log.info("Two check-ins missed in a row; pausing the session retroactively")
+        engine.pause(at=at)
+        self.reanchor()
+        self.auto_paused.emit()
+
+    def _reset_misses(self) -> None:
+        self._misses = 0
+        self._first_miss_epoch = None
 
     # ================================================================== records
     def _record(self, session_id: int, response: str, reason: str | None) -> None:
@@ -426,8 +468,7 @@ class CheckInService(QObject):
         engine = self._ctx.engine
         self._sid = engine.session_id
         self._planner.reset(engine.focused_seconds if engine.is_active else 0.0)
-        self._misses = 0
-        self._first_miss_epoch = None
+        self._reset_misses()
         self._set_deferred(False)
 
     def _on_session_started(self, sid: int) -> None:
@@ -435,8 +476,7 @@ class CheckInService(QObject):
         self._miss_pause_sid = None
         self._sid = int(sid)
         self._planner.reset(0.0)
-        self._misses = 0
-        self._first_miss_epoch = None
+        self._reset_misses()
         self._set_deferred(False)
 
     def _on_state_changed(self, state: str) -> None:
@@ -447,8 +487,7 @@ class CheckInService(QObject):
             self._miss_pause_sid = None
         if state in ("idle", "break"):
             self._sid = None
-            self._misses = 0
-            self._first_miss_epoch = None
+            self._reset_misses()
             self._set_deferred(False)
         elif state == "focus":
             self.evaluate()

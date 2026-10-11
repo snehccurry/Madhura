@@ -6,7 +6,7 @@
     window = create_main_window(ctx)                # sets ctx.window
     start_services(ctx)                             # pill, check-ins, nudges, away, habits; restore
 
-Startup order: AUMID → platform env (Wayland → xcb) → single instance → logging → QApplication
+Startup order: AUMID → platform env (Wayland → "xcb;wayland") → single instance → logging → QApplication
 (Fusion, no quit on last window, icon) → fonts → staged restore → DB/settings/theme →
 context → main window → tray → services → engine.restore() → show (or tray-only) →
 onboarding → pending session-complete sheet.
@@ -19,7 +19,7 @@ import logging
 import os
 import sqlite3
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -34,6 +34,7 @@ from madhura.platform import IS_LINUX
 from madhura.platform import windows as win_platform
 
 if TYPE_CHECKING:
+    from madhura.data.db import DatabaseUnavailable
     from madhura.ui.main_window import MainWindow
 
 __all__ = [
@@ -83,10 +84,16 @@ def resolve_tray_available(override: bool | None = None) -> bool:
         return False
 
 
+#: Qt tries each entry in order. xcb needs libxcb-cursor0 (Qt ≥ 6.5), which many Wayland desktops
+#: don't install; a bare "xcb" would then abort in qFatal instead of falling back to Wayland.
+XWAYLAND_QPA = "xcb;wayland"
+
+
 def _prepare_platform_env() -> None:
-    """Linux: prefer xcb under Wayland (tray, window raising and positioning work there)."""
+    """Linux: prefer xcb under Wayland (tray, window raising and positioning work there), falling
+    back to the native Wayland plugin when xcb can't load."""
     if IS_LINUX and os.environ.get("WAYLAND_DISPLAY") and not os.environ.get("QT_QPA_PLATFORM") and os.environ.get("DISPLAY"):
-        os.environ["QT_QPA_PLATFORM"] = "xcb"
+        os.environ["QT_QPA_PLATFORM"] = XWAYLAND_QPA
 
 
 def _app_icon() -> QIcon:
@@ -251,22 +258,55 @@ def create_main_window(ctx: AppContext) -> MainWindow:
     return window
 
 
-def _construct(ctx: AppContext, attr: str, module: str, cls: str) -> None:
+def _construct(ctx: AppContext, attr: str, factory: Callable[[AppContext], object]) -> None:
     try:
-        mod = __import__(module, fromlist=[cls])
-        setattr(ctx, attr, getattr(mod, cls)(ctx))
+        setattr(ctx, attr, factory(ctx))
     except Exception:  # noqa: BLE001 - one broken feature service must not stop the app
-        log.exception("Could not start %s", cls)
+        log.exception("Could not start %s", attr)
         setattr(ctx, attr, None)
+
+
+# Feature services are imported here, through literal import statements, rather than by module
+# name: a frozen build's import analysis (PyInstaller) only follows the former.
+
+
+def _pill(ctx: AppContext) -> object:
+    from madhura.ui.overlays.pill import PillController
+
+    return PillController(ctx)
+
+
+def _checkins(ctx: AppContext) -> object:
+    from madhura.services.checkin_service import CheckInService
+
+    return CheckInService(ctx)
+
+
+def _nudges(ctx: AppContext) -> object:
+    from madhura.services.nudge_service import NudgeService
+
+    return NudgeService(ctx)
+
+
+def _away(ctx: AppContext) -> object:
+    from madhura.services.away_service import AwayService
+
+    return AwayService(ctx)
+
+
+def _habit_reminders(ctx: AppContext) -> object:
+    from madhura.services.habit_reminders import HabitReminderService
+
+    return HabitReminderService(ctx)
 
 
 def start_services(ctx: AppContext) -> None:
     """Create the feature services, connect app-level signals, then ``engine.restore()`` (last)."""
-    _construct(ctx, "pill", "madhura.ui.overlays.pill", "PillController")
-    _construct(ctx, "checkins", "madhura.services.checkin_service", "CheckInService")
-    _construct(ctx, "nudges", "madhura.services.nudge_service", "NudgeService")
-    _construct(ctx, "away", "madhura.services.away_service", "AwayService")
-    _construct(ctx, "habit_reminders", "madhura.services.habit_reminders", "HabitReminderService")
+    _construct(ctx, "pill", _pill)
+    _construct(ctx, "checkins", _checkins)
+    _construct(ctx, "nudges", _nudges)
+    _construct(ctx, "away", _away)
+    _construct(ctx, "habit_reminders", _habit_reminders)
 
     events = ctx.events
     engine = ctx.engine
@@ -327,6 +367,15 @@ def flush_data(ctx: AppContext) -> None:
             window.flush_toasts()
         except Exception:  # noqa: BLE001 - undo callbacks are feature code; keep flushing the rest
             log.exception("Flushing toasts failed")
+    if not ctx.repo.closed:
+        try:
+            # Notes typed in an open "Session complete" sheet; the sheet itself comes back on
+            # the next launch (kv pending_complete) for "Mark done" to be confirmed.
+            from madhura.ui.overlays.session_complete import save_open_sheets
+
+            save_open_sheets(ctx)
+        except Exception:  # noqa: BLE001 - feature code; keep flushing the rest
+            log.exception("Saving the open session summaries failed")
     ctx.settings.flush()
     if not ctx.repo.closed:
         try:
@@ -420,7 +469,8 @@ def _create_tray(ctx: AppContext) -> None:
         ctx.tray = None
 
 
-def _show_lock_error(argv: list[str], message: str) -> None:
+def _show_startup_error(argv: list[str], title: str, message: str) -> None:
+    """Modal error before the main window exists (themed with the defaults)."""
     app = QApplication.instance() or QApplication(argv)
     app.setStyle("Fusion")
     from madhura.ui import dialogs, fonts
@@ -428,7 +478,20 @@ def _show_lock_error(argv: list[str], message: str) -> None:
 
     fonts.apply_app_font(app)
     ThemeManager().apply(app)
-    dialogs.show_error(None, f"{APP_NAME} is already running", message)
+    dialogs.show_error(None, title, message)
+
+
+def _show_lock_error(argv: list[str], message: str) -> None:
+    _show_startup_error(argv, f"{APP_NAME} is already running", message)
+
+
+def _database_unavailable_message(exc: DatabaseUnavailable) -> str:
+    return (
+        f"Another program may be using {exc.path.name} (a database browser, backup or sync tool), "
+        f"or its folder isn't reachable yet. Nothing was changed.\n\n"
+        f"Close that program, or wait a moment, then start {APP_NAME} again.\n\n"
+        f"Folder: {exc.path.parent}\nDetails: {exc.reason}"
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -462,6 +525,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     log.info("Starting %s %s", APP_NAME, __version__)
 
     app = QApplication.instance() or QApplication(argv_list)
+    guard.listen()  # as early as possible: a racing second launch waits for this (single_instance)
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_NAME)
     app.setOrganizationName(APP_NAME)
@@ -470,7 +534,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     app.setStyle("Fusion")
     app.setQuitOnLastWindowClosed(False)
     app.setWindowIcon(_app_icon())
-    guard.listen()
+    win_platform.register_app_user_model_id(APP_ID, APP_NAME, paths.asset("icon.png"))
 
     from madhura.ui import fonts
     from madhura.ui.widgets.inputs import install_wheel_guard
@@ -481,7 +545,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     holder: list[AppContext] = []
     install_excepthook(_make_error_reporter(holder))
 
-    ctx = create_context(app, paths.data_dir(), SystemClock())
+    from madhura.data import db as dbmod
+
+    try:
+        ctx = create_context(app, paths.data_dir(), SystemClock())
+    except dbmod.DatabaseUnavailable as exc:
+        # Locked or unreachable is not damaged: never start fresh on top of a healthy database.
+        try:
+            _show_startup_error(argv_list, f"{APP_NAME} can't open its data right now", _database_unavailable_message(exc))
+        except Exception:  # noqa: BLE001 - best effort; the exit code still reports the failure
+            log.exception("Could not show the database error dialog")
+        guard.release()
+        return 1
     holder.append(ctx)
     window = create_main_window(ctx)
     if ctx.tray_available:

@@ -244,7 +244,7 @@ class CheckInPopup(FloatingPanel):
         self.set_content(self.reason_page, animate=True)
         self._reason_countdown.start(REASON_MS)
         if self.underMouse():
-            self._reason_countdown.set_hover(True)
+            self._on_hover(True)
 
     def choose_reason(self, reason: str | None) -> None:
         """Pick a reason (as if its chip was clicked); None logs without a reason."""
@@ -305,6 +305,8 @@ class CheckInPopup(FloatingPanel):
             self._update_bar()
         elif self._phase == "reason":
             self._reason_countdown.set_hover(hovered)
+            if self._service is not None:
+                self._service.set_prompt_hover(hovered)  # holds the service's reason fallback too
 
     def _on_closed(self) -> None:
         self._bar_timer.stop()

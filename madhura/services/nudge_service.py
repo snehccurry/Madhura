@@ -10,7 +10,9 @@ start, or input resuming after away). Repeats every ``nudge_idle_minutes`` while
   auto-hide). The first nudge of a logical day with a planned task reads "Good morning — your
   first block: <task>".
 * firm → ``window.show_main('focus', activate=False)`` (raise without focus) + the Focus page's
-  nudge banner, gated on input idle ≥ 2 s so it never lands mid-keystroke.
+  nudge banner, gated on input idle ≥ 2 s so it never lands mid-keystroke. When the user is
+  already in Madhura (active window) only the banner is set — the page they are on is never
+  switched — and an open sheet in an inactive window postpones the raise to the next round.
 
 Once per logical day, at the first eligible-idle moment after ``work_end``, a gentle "Wrap up your
 day?" panel opens the WrapUpSheet. Evaluation runs on a single-shot timer (≤ 30 s) and on every
@@ -422,14 +424,17 @@ class NudgeService(QObject):
             return
         mode = ctx.settings.get("nudge_mode")
         if mode == "firm" and ctx.window is not None:
-            if self._banner and self._window_showing_focus():
+            in_window = self._window_active()
+            if (in_window and self._banner) or (not in_window and self._window_has_sheet()):
+                # Already waiting on Focus for a user who is in Madhura; or a sheet is open:
+                # don't navigate underneath it. Try again next round.
                 self._arm()
                 return
             idle = ctx.attention.input_idle_seconds()
             if idle is not None and idle < FIRM_INPUT_IDLE_SECONDS:
                 self._firm_retry.start()
                 return
-            self._deliver_firm(variant)
+            self._deliver_firm(variant, raise_window=not in_window)
         else:
             if self._stack_busy():
                 self._arm(BUSY_STACK_RETRY_MS)
@@ -459,11 +464,14 @@ class NudgeService(QObject):
         self._panel = panel
         panel.present()
 
-    def _deliver_firm(self, variant: str) -> None:
+    def _deliver_firm(self, variant: str, raise_window: bool = True) -> None:
+        """Set the Focus page banner; *raise_window* also brings the window up on Focus (never
+        while the user is in Madhura — the page they are on stays)."""
         window = self._ctx.window
         if window is None:
             return
-        window.show_main("focus", activate=False)
+        if raise_window:
+            window.show_main("focus", activate=False)
         window.set_nudge_banner(True)
         if not self._banner:
             self._banner = True
@@ -483,11 +491,18 @@ class NudgeService(QObject):
             log.debug("nudge sound failed", exc_info=True)
         self.nudged.emit("wrap_up")
 
-    def _window_showing_focus(self) -> bool:
-        """The user is looking at the Focus page (active window) — no need to raise it again."""
+    def _window_active(self) -> bool:
+        """The user is in Madhura (active main window): never raise it or switch its page."""
         window = self._ctx.window
         try:
-            return bool(window is not None and window.is_main_active() and window.current_page() == "focus")
+            return bool(window is not None and window.is_main_active())
+        except RuntimeError:
+            return False
+
+    def _window_has_sheet(self) -> bool:
+        window = self._ctx.window
+        try:
+            return bool(window is not None and window.has_sheet())
         except RuntimeError:
             return False
 

@@ -16,8 +16,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QEvent, QPoint, QRect, QRectF, QSize, Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QHelpEvent, QKeyEvent, QMouseEvent, QPainter, QPaintEvent, QPen
+from PySide6.QtCore import QEvent, QPoint, QRect, QRectF, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFocusEvent, QHelpEvent, QKeyEvent, QMouseEvent, QPainter, QPaintEvent, QPen
 from PySide6.QtWidgets import QSizePolicy, QToolTip, QWidget
 
 from madhura.core.timefmt import MONTHS_SHORT, fmt_date_short, fmt_duration, fmt_time
@@ -47,16 +47,18 @@ __all__ = [
 
 log = logging.getLogger(__name__)
 
+_GENTLE_NUDGE = "A quiet panel in the corner asks what's next. It never takes focus."
+
 #: One-line explanation of each nudge mode (Settings → Accountability).
 NUDGE_EXPLANATIONS: dict[str, str] = {
     "off": "No nudges. Madhura stays quiet between blocks.",
-    "gentle": "A small panel in the corner asks what's next. It never takes focus.",
+    "gentle": _GENTLE_NUDGE,
     "firm": "Brings Madhura forward between blocks — without stealing focus — until you plan or snooze.",
 }
 
 #: (mode, title, body, icon) for the onboarding accountability cards.
 NUDGE_CHOICES: tuple[tuple[str, str, str, str], ...] = (
-    ("gentle", "Gentle", "A quiet panel in the corner asks what's next. It never steals focus.", "bell"),
+    ("gentle", "Gentle", _GENTLE_NUDGE, "bell"),
     ("firm", "Firm", "Madhura comes forward until you plan the next block or snooze.", "flag"),
     ("off", "Off", "No nudges. You plan when you're ready.", "bell_off"),
 )
@@ -214,7 +216,8 @@ class AccentPicker(KeyboardFocusMixin, QWidget):
 
     One tab stop; ←/→ (↑/↓) move *and* select, Home/End jump, Space/Enter select. Swatches use the
     accent variant of the current scheme and repaint on theme changes. ``valueChanged(str)`` fires
-    on user changes only (``set_value`` is silent).
+    on user changes only (``set_value`` is silent); :meth:`set_key_commit_delay` coalesces
+    arrow-key runs into one emission (re-styling the app is expensive).
     """
 
     valueChanged = Signal(str)
@@ -239,7 +242,18 @@ class AccentPicker(KeyboardFocusMixin, QWidget):
         self.setFixedSize(n * self.SLOT + (n - 1) * self.GAP, self.SLOT)
         self.setAccessibleName("Accent color")
         self._sync_accessible()
+        self._reported = self._value  # what listeners last heard (emitted or set_value)
+        self._key_commit_ms = 0
+        self._commit_timer = QTimer(self)
+        self._commit_timer.setSingleShot(True)
+        self._commit_timer.timeout.connect(self._commit)
         theme.current().changed.connect(self.update)
+
+    def set_key_commit_delay(self, ms: int) -> None:
+        """Arrow/Home/End keys select at once but emit ``valueChanged`` only after *ms* without
+        another key (Space/Enter, focus-out or hiding emit at once). Clicks always emit at once.
+        0 (default) emits on every key."""
+        self._key_commit_ms = max(0, int(ms))
 
     # ------------------------------------------------------------------ API
     def names(self) -> list[str]:
@@ -253,7 +267,9 @@ class AccentPicker(KeyboardFocusMixin, QWidget):
     def set_value(self, name: str) -> None:
         """Select *name* without emitting (unknown names are ignored)."""
         if name in self._names:
+            self._commit_timer.stop()
             self._value = name
+            self._reported = name
             self._focus = self._names.index(name)
             self._sync_accessible()
             self.update()
@@ -274,18 +290,25 @@ class AccentPicker(KeyboardFocusMixin, QWidget):
     def _sync_accessible(self) -> None:
         self.setAccessibleDescription(f"{ACCENT_LABELS.get(self._value, self._value.title())} selected")
 
-    def _choose(self, index: int) -> None:
+    def _choose(self, index: int, *, from_key: bool = False) -> None:
         if not 0 <= index < len(self._names):
             return
         self._focus = index
-        name = self._names[index]
-        changed = name != self._value
-        self._value = name
+        self._value = self._names[index]
         self._sync_accessible()
         self.update()
         self.update_focus_ring()
-        if changed:
-            self.valueChanged.emit(name)
+        if from_key and self._key_commit_ms > 0:
+            self._commit_timer.start(self._key_commit_ms)
+        else:
+            self._commit()
+
+    def _commit(self) -> None:
+        """Emit the selection now (once, and only if it really changed)."""
+        self._commit_timer.stop()
+        if self._value != self._reported:
+            self._reported = self._value
+            self.valueChanged.emit(self._value)
 
     def _index_at(self, pos: QPoint) -> int:
         for i in range(len(self._names)):
@@ -297,13 +320,13 @@ class AccentPicker(KeyboardFocusMixin, QWidget):
         key = event.key()
         n = len(self._names)
         if key in (Qt.Key.Key_Left, Qt.Key.Key_Up):
-            self._choose((self._focus - 1) % n)
+            self._choose((self._focus - 1) % n, from_key=True)
         elif key in (Qt.Key.Key_Right, Qt.Key.Key_Down):
-            self._choose((self._focus + 1) % n)
+            self._choose((self._focus + 1) % n, from_key=True)
         elif key == Qt.Key.Key_Home:
-            self._choose(0)
+            self._choose(0, from_key=True)
         elif key == Qt.Key.Key_End:
-            self._choose(n - 1)
+            self._choose(n - 1, from_key=True)
         elif key in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter) and not (
             event.modifiers() & Qt.KeyboardModifier.ControlModifier
         ):
@@ -316,6 +339,16 @@ class AccentPicker(KeyboardFocusMixin, QWidget):
     def focusInEvent(self, event: object) -> None:  # noqa: N802
         self._focus = self._names.index(self._value)
         super().focusInEvent(event)  # type: ignore[arg-type]
+
+    def focusOutEvent(self, event: QFocusEvent) -> None:  # noqa: N802
+        if self._commit_timer.isActive():
+            self._commit()
+        super().focusOutEvent(event)
+
+    def hideEvent(self, event: object) -> None:  # noqa: N802
+        if self._commit_timer.isActive():
+            self._commit()
+        super().hideEvent(event)  # type: ignore[arg-type]
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         idx = self._index_at(event.position().toPoint())

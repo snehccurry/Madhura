@@ -65,7 +65,7 @@ class InlineBanner(QWidget):
         grid.addWidget(self._label, 0, 0)
         self._actions = QWidget(self)
         self._actions_box = QHBoxLayout(self._actions)
-        self._actions_box.setSpacing(2)
+        self._actions_box.setSpacing(12)  # separate actions: "Move to today   Dismiss", not one phrase
         self._actions_box.setContentsMargins(-4, 0, 0, 0)
         grid.addWidget(self._actions, 0, 1, Qt.AlignmentFlag.AlignVCenter)
         self._close = IconButton("x", "Dismiss", 24, self, glyph=14)

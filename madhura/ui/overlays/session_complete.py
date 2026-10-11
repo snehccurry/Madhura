@@ -12,6 +12,14 @@ pending sheet.
   stack, priority 0, auto-hides after 120 s) and kv ``pending_complete`` = id, so the note /
   mark-done sheet appears the next time the main window is shown or activated
   (:func:`show_pending_complete`).
+
+kv ``pending_complete`` is also set while an in-window sheet is open (closing it clears the key),
+and :func:`save_open_sheets` (quit / logoff) writes the typed note without closing anything, so a
+summary that was never closed comes back on the next launch with its note — "Mark done" waits for
+the user's confirmation there instead of being applied behind their back.
+
+Text-only outcomes (restored / abandoned) toast in the window; when the window isn't visible the
+"Too short to save" result of a Finish from the pill or tray goes to a system notification.
 """
 
 from __future__ import annotations
@@ -44,8 +52,9 @@ from PySide6.QtWidgets import QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWi
 from madhura.core.timefmt import fmt_time
 from madhura.ui import animations, fonts, theme
 from madhura.ui.pages.focus.active_view import ClampedText
+from madhura.ui.shortcuts_sheet import display_keys
 from madhura.ui.widgets._common import fill_rounded
-from madhura.ui.widgets.buttons import Button
+from madhura.ui.widgets.buttons import Button, IconButton
 from madhura.ui.widgets.checkbox import Checkbox
 from madhura.ui.widgets.chips import ChipGroup
 from madhura.ui.widgets.inputs import TextArea
@@ -60,10 +69,12 @@ if TYPE_CHECKING:
 __all__ = [
     "present_session_complete",
     "show_pending_complete",
+    "save_open_sheets",
     "SessionCompleteSheet",
     "CompletionPanel",
     "PENDING_KEY",
     "PANEL_AUTO_HIDE_MS",
+    "PENDING_ACTIONS_SECONDS",
     "KEEP_GOING_MINUTES",
     "BREAK_CHOICES",
     "minutes_summary",
@@ -76,6 +87,10 @@ log = logging.getLogger(__name__)
 
 PENDING_KEY = "pending_complete"
 PANEL_AUTO_HIDE_MS = 120_000
+#: A pending sheet still offers "Take a break" / "Keep going" this long after the session ended.
+PENDING_ACTIONS_SECONDS = 5 * 60
+TOO_SHORT_TITLE = "Too short to save"
+TOO_SHORT_BODY = "Sessions under a minute of focus aren't kept."
 KEEP_GOING_MINUTES = 15
 BREAK_CHOICES: tuple[int, ...] = (5, 10, 15)
 COUNTED = ("completed", "ended_early")
@@ -115,6 +130,7 @@ class _PerContext:
 _SHEETS = _PerContext("sheets")  # ctx → {session_id: SessionCompleteSheet}
 _PANELS = _PerContext("panel")  # ctx → CompletionPanel
 _WATCHERS = _PerContext("watcher")  # ctx → _PendingWatcher
+_ACTED = _PerContext("acted")  # ctx → {session_id} whose panel break / plan-next was used
 
 
 # =========================================================================== text helpers
@@ -325,6 +341,10 @@ class SessionCompleteSheet(SheetContent):
     completed, unchecked for ended early). Footer: ghost "Done" (Esc) · secondary "Keep going +15"
     · primary "Take a 5-min break" (break chips 5/10/15 above) or "Plan next" when breaks are
     off (Ctrl+Enter). The note and mark-done are saved however the sheet closes.
+
+    A *pending* sheet shown after the moment has passed (the session ended more than
+    :data:`PENDING_ACTIONS_SECONDS` ago, the panel's break / plan-next was used, or another
+    session ran since) only offers "Done": the note and mark-done are what's left to do.
     """
 
     sheet_width = 440
@@ -361,6 +381,9 @@ class SessionCompleteSheet(SheetContent):
         session = self._session
         completed = self.outcome == "completed"
         self._title_text = "Session complete" if completed else "Session ended"
+        self._saved_note = ((session.note or "").strip() or None) if session is not None else None
+        #: False for a pending sheet that comes too late for "Take a break" / "Keep going".
+        self.offers_actions = not (self.pending and self._moved_on())
 
         body = self.body
         body.setSpacing(0)
@@ -489,6 +512,28 @@ class SessionCompleteSheet(SheetContent):
         value = self.break_chips.value()
         return int(value) if value is not None else int(self._ctx.settings.get("break_minutes"))
 
+    def _moved_on(self) -> bool:
+        """True when the user has moved on since the session ended: the panel's break / plan-next
+        was used, the session ended more than a few minutes ago, or another session ran since."""
+        ctx = self._ctx
+        session = self._session
+        if session is None:
+            return True
+        acted = _ACTED.get(ctx)
+        if acted is not None and self.session_id in acted:
+            return True
+        ended = session.ended_at
+        if ended is None:
+            return False
+        if (ctx.clock.now() - ended).total_seconds() > PENDING_ACTIONS_SECONDS:
+            return True
+        try:
+            newest = ctx.repo.recent_sessions(1)
+        except sqlite3.Error:
+            log.debug("Could not read the latest session", exc_info=True)
+            return False
+        return bool(newest) and newest[0].id != self.session_id and newest[0].started_at >= ended
+
     def _on_engine_state(self, _state: str) -> None:
         if not self._committed:
             self._sync_actions()
@@ -504,18 +549,20 @@ class SessionCompleteSheet(SheetContent):
 
     def _sync_actions(self) -> None:
         """Footer for the engine's state: idle → Done · Keep going · break/Plan next; a break
-        already running (auto-start) → Done · Keep going; a session running → Done."""
+        already running (auto-start) → Done · Keep going; a session running → Done. A pending
+        sheet that comes too late (:attr:`offers_actions` False) → Done."""
         state = str(self._ctx.engine.state)
         session = self._session
-        idle = state == "idle"
-        can_keep = session is not None and state in ("idle", "break")
+        offer = self.offers_actions
+        idle = offer and state == "idle"
+        can_keep = offer and session is not None and state in ("idle", "break")
         self.keep_button.setVisible(can_keep)
         self.main_button.setVisible(idle)
         offer_break = idle and self.breaks_offered()
         self.break_row.setVisible(offer_break)
         if idle:
             self.main_button.setText(f"Take a {self.selected_break_minutes()}-min break" if offer_break else "Plan next")
-            self.main_button.setToolTip(f"{self.main_button.text()} · Ctrl+Enter")
+            self.main_button.setToolTip(f"{self.main_button.text()} · {display_keys('Ctrl+Enter')}")
             self.done_button.set_variant("ghost")
             self.set_primary(self.main_button)
         else:
@@ -565,6 +612,30 @@ class SessionCompleteSheet(SheetContent):
         """Draw the check once the card has started to appear."""
         self._check_timer.start(120 if animations.motion_enabled() else 0)
 
+    def _note_value(self) -> str | None:
+        return self.note.text().strip() or None
+
+    def _save_note(self) -> None:
+        note = self._note_value()
+        if self._session is not None and note != self._saved_note:
+            self._ctx.repo.update_session(self.session_id, note=note)
+            self._saved_note = note
+            self._ctx.events.data_changed.emit("sessions")
+
+    def save_draft(self) -> None:
+        """Write the typed note to the session now, keeping the sheet open and uncommitted.
+
+        Used on quit / logoff (``app.flush_data``): "Mark done" is *not* applied — kv
+        ``pending_complete`` brings the sheet back on the next launch (note filled in) for the
+        user to confirm, and a cancelled logoff leaves this sheet fully editable.
+        """
+        if self._committed:
+            return
+        try:
+            self._save_note()
+        except sqlite3.Error:
+            log.exception("Could not save the session note")
+
     def _commit(self) -> None:
         """Save the note and mark-done (once, however the sheet closed)."""
         if self._committed:
@@ -581,14 +652,9 @@ class SessionCompleteSheet(SheetContent):
             except (RuntimeError, TypeError):
                 pass
         _forget_sheet(ctx, self)
-        session = self._session
         repo = ctx.repo
         try:
-            if session is not None:
-                note = self.note.text().strip() or None
-                if note != ((session.note or "").strip() or None):
-                    repo.update_session(self.session_id, note=note)
-                    ctx.events.data_changed.emit("sessions")
+            self._save_note()
             task = self._task
             if task is not None and self.mark_done is not None and self._apply_mark_done:
                 checked = self.mark_done.isChecked()
@@ -608,8 +674,9 @@ class SessionCompleteSheet(SheetContent):
 class CompletionPanel(FloatingPanel):
     """Non-activating "Nice — 60 min on <task>" panel (popup stack priority 0).
 
-    Buttons: primary "Take a 5-min break" (or "Plan next" when breaks are off), "Keep going +15",
-    "Done". Auto-hides after 120 s (hovering pauses the countdown).
+    Buttons: primary "Take a 5-min break" (or "Plan next" when breaks are off) and "Keep going
+    +15" side by side (regular size, like the other floating panels), "Done" as the header's ✕.
+    Auto-hides after 120 s (hovering pauses the countdown).
     """
 
     def __init__(self, ctx: AppContext, session_id: int, outcome: str = "completed") -> None:
@@ -642,26 +709,33 @@ class CompletionPanel(FloatingPanel):
         texts.setSpacing(2)
         minutes = int(max(0, session.focused_seconds) // 60) if session is not None else 0
         task = session.task if session is not None else ""
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(8)
         self.title_label = ClampedText("label", 2, content, align=Qt.AlignmentFlag.AlignLeft)
         self.title_label.setFont(fonts.font(14, 600))
         self.title_label.set_text(f"Nice — {minutes} min on {task}")
-        texts.addWidget(self.title_label)
+        title_row.addWidget(self.title_label, 1)
+        # "Done" closes the panel: the header ✕ of the other floating panels (nudge, habit).
+        self.done_button = IconButton("x", "Done", 24, content, glyph=14, accessible_name="Done")
+        title_row.addWidget(self.done_button, 0, Qt.AlignmentFlag.AlignTop)
+        texts.addLayout(title_row)
         self.score_label = _set_font(Caption(self._score_line(counts), content), 12, 400, tabular=True)
         self.score_label.setWordWrap(True)
         texts.addWidget(self.score_label)
         top.addLayout(texts, 1)
         v.addLayout(top)
 
+        # Full content width, regular ("md") buttons like the check-in / nudge / away panels;
+        # "Take a 10-min break" + "Keep going +15" fit the 308 px content side by side.
         row = QHBoxLayout()
-        row.setContentsMargins(44, 0, 0, 0)
-        row.setSpacing(6)
-        self.main_button = Button("", "primary", size="sm", parent=content)
-        self.keep_button = Button(f"Keep going +{KEEP_GOING_MINUTES}", "secondary", size="sm", parent=content)
-        self.done_button = Button("Done", "ghost", size="sm", parent=content)
-        row.addWidget(self.main_button)
-        row.addWidget(self.keep_button)
-        row.addStretch(1)
-        row.addWidget(self.done_button)
+        row.setContentsMargins(0, 2, 0, 0)
+        row.setSpacing(8)
+        self.main_button = Button("", "primary", size="md", parent=content)
+        self.keep_button = Button(f"Keep going +{KEEP_GOING_MINUTES}", "secondary", size="md", parent=content)
+        for b in (self.main_button, self.keep_button):
+            b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            row.addWidget(b, 1)
         v.addLayout(row)
         self.set_content(content)
 
@@ -709,7 +783,6 @@ class CompletionPanel(FloatingPanel):
         self.main_button.setText(f"Take a {minutes}-min break" if self.breaks_offered() else "Plan next")
         self.main_button.setVisible(idle)
         self.keep_button.setVisible(self._session is not None and state in ("idle", "break"))
-        self.done_button.set_variant("ghost" if idle else "secondary")
         self.disable_child_focus()
 
     # ------------------------------------------------------------------ presenting
@@ -753,8 +826,13 @@ class CompletionPanel(FloatingPanel):
         self.deleteLater()
 
     # ------------------------------------------------------------------ actions
+    def _mark_acted(self) -> None:
+        # The pending sheet (note / mark-done) still follows, but no longer offers the break.
+        _ACTED.setdefault(self._ctx, set()).add(self.session_id)
+
     def _on_primary(self) -> None:
         if self.breaks_offered():
+            self._mark_acted()
             self.dismiss()
             self._ctx.engine.start_break(int(self._ctx.settings.get("break_minutes")))
         else:
@@ -775,6 +853,7 @@ class CompletionPanel(FloatingPanel):
 
     def plan_next(self) -> None:
         """Open Madhura on the Focus page and focus the task field."""
+        self._mark_acted()
         self.dismiss()
         window = self._ctx.window
         if window is not None:
@@ -853,8 +932,17 @@ def _show_sheet(ctx: AppContext, session_id: int, outcome: str, *, pending: bool
         panel.dismiss()
     sheet = SessionCompleteSheet(ctx, session_id, outcome, pending=pending)
     sheets[session_id] = sheet
+    # Until the sheet is closed (``_commit`` clears it), a quit / logoff / crash brings it back.
+    _remember_pending(ctx, session_id)
     window.show_sheet(sheet)
     return sheet
+
+
+def _remember_pending(ctx: AppContext, session_id: int) -> None:
+    try:
+        ctx.repo.kv_set(PENDING_KEY, int(session_id))
+    except sqlite3.Error:
+        log.exception("Could not remember the pending session summary")
 
 
 def _show_panel(ctx: AppContext, session_id: int, outcome: str) -> CompletionPanel:
@@ -881,10 +969,21 @@ def present_session_complete(ctx: AppContext, session_id: int, outcome: str, res
         log.exception("Could not load session %s", session_id)
         session = None
     if restored:
+        # Toasted even when the window is hidden (autostart into the tray): the toast host holds
+        # it until the window is shown.
         _toast(ctx, restored_text(session.task if session is not None else ""), "info", 6000)
         return
     if outcome == "abandoned":
-        _toast(ctx, "Too short to save" if session is None else "Session discarded", "info")
+        too_short = session is None  # the engine deleted the row (under a minute of focus)
+        window = ctx.window
+        if window is not None and not window.is_main_visible():
+            # Ended from the pill or the tray: a window toast would only show up much later.
+            if not too_short:
+                return  # an explicit Abandon: the pill going away is the feedback
+            if ctx.notifier.notify(TOO_SHORT_TITLE, TOO_SHORT_BODY):
+                return  # a Finish that saved nothing: say so where the user is looking
+            # No tray to notify through: the toast waits for the window instead.
+        _toast(ctx, TOO_SHORT_TITLE if too_short else "Session discarded", "info")
         return
     if outcome not in COUNTED or session is None:
         return
@@ -894,8 +993,31 @@ def present_session_complete(ctx: AppContext, session_id: int, outcome: str, res
         _show_sheet(ctx, int(session_id), outcome)
         return
     _show_panel(ctx, int(session_id), outcome)
+    _remember_pending(ctx, int(session_id))
+
+
+def save_open_sheets(ctx: AppContext) -> None:
+    """Quit / logoff (``app.flush_data``): save the note of every open summary sheet.
+
+    The sheets stay open and uncommitted (``commitDataRequest`` may be followed by a cancelled
+    logoff, and "Mark done" must not be applied without the user's confirmation); kv
+    ``pending_complete`` is made to point at one of them so it comes back on the next launch.
+    """
+    sheets = _SHEETS.get(ctx)
+    if not sheets or ctx.repo.closed:
+        return
+    live: list[SessionCompleteSheet] = []
+    for sheet in list(sheets.values()):
+        try:
+            sheet.save_draft()
+        except RuntimeError:  # the C++ side is already gone
+            continue
+        live.append(sheet)
+    if not live:
+        return
     try:
-        ctx.repo.kv_set(PENDING_KEY, int(session_id))
+        if ctx.repo.kv_get(PENDING_KEY) is None:
+            ctx.repo.kv_set(PENDING_KEY, live[0].session_id)
     except sqlite3.Error:
         log.exception("Could not remember the pending session summary")
 

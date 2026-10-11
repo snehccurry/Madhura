@@ -9,13 +9,17 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, Qt
+from PySide6.QtGui import QKeyEvent
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication
 
 from madhura.context import AppContext
 from madhura.core import analytics as an
 from madhura.ui import animations, dialogs, theme
 from madhura.ui.pages import _insights_kit as kit
-from madhura.ui.pages.insights_page import FADE_MS, SIDE_BY_SIDE_MIN, InsightsPage, _FadeOverlay
+from madhura.ui.pages.insights_page import FADE_MS, KPI_FOUR_COLUMNS_MIN, SIDE_BY_SIDE_MIN, InsightsPage, _FadeOverlay, _KpiGrid
+from madhura.ui.widgets.stat_card import StatCard
 from test_i_support import TODAY, add_session, ictx, key, load_seed_demo, no_summary, pump, show, win_of  # noqa: F401
 
 
@@ -114,6 +118,18 @@ def test_streak_hint_and_habits_kpi(ictx: AppContext) -> None:
     assert page.kpi_habits.value_text() == "100%" and page.kpi_habits.hint_text() == "5 of 5 done"
     # previous 7 days: Oct 1–7 scheduled, nothing done → 0 % → +100 pts
     assert page.kpi_habits.delta_text() == "▲ 100 pts"
+
+
+def test_habits_kpi_counts_a_habit_created_after_midnight(ictx: AppContext) -> None:
+    ictx.clock.set(datetime(2026, 10, 15, 1, 40))  # type: ignore[attr-defined]  # logical Wed 14 Oct
+    hid = ictx.repo.add_habit("Stretch")
+    ictx.repo.update_habit(hid, created_at=datetime(2026, 10, 15, 1, 30))
+    ictx.repo.set_habit_status(hid, date(2026, 10, 14), "done")
+    snap = kit.load_snapshot(ictx, "7d")
+    assert snap.today == date(2026, 10, 14)
+    # the Habits page counts it done today; Insights agrees
+    assert an.habit_day_counts(ictx.repo.habits(), ictx.repo.habit_logs_for_date(snap.today), snap.today) == (1, 1)
+    assert (snap.habit_done, snap.habit_scheduled) == (1, 1)
 
 
 def test_counting_rule_excludes_abandoned_and_active(ictx: AppContext) -> None:
@@ -381,9 +397,11 @@ def test_recent_keyboard_delete_and_menu(ictx: AppContext) -> None:
     lst.setFocus(Qt.FocusReason.TabFocusReason)
     pump()
     assert lst.selected_index() == 0 and lst.rows[0].is_selected()
+    assert lst.accessibleDescription() == f"{lst.rows[0].accessibleName()}, 1 of {len(lst.rows)}"
     key(lst, Qt.Key.Key_Down)
     key(lst, Qt.Key.Key_Down)
     assert lst.selected_index() == 2
+    assert lst.accessibleDescription() == f"{lst.rows[2].accessibleName()}, 3 of {len(lst.rows)}"  # announced
     key(lst, Qt.Key.Key_End)
     assert lst.selected_index() == 4
     key(lst, Qt.Key.Key_Home)
@@ -393,6 +411,56 @@ def test_recent_keyboard_delete_and_menu(ictx: AppContext) -> None:
     menu = lst.rows[0].open_menu()
     assert [a.text() for a in menu.actions()] == ["Delete session"]
     menu.close()
+
+
+def test_recent_delete_keeps_the_selection_in_place(ictx: AppContext) -> None:
+    """After Delete the selection is the row that took the deleted one's place — not the newest
+    session (which a second Delete would then remove) — and a held key deletes only one."""
+    seed_week(ictx)
+    show(ictx)
+    page = page_of(ictx)
+    lst = page.recent_list
+    lst.setFocus(Qt.FocusReason.TabFocusReason)
+    pump()
+    n = len(lst.rows)
+    lst.select(2)
+    deleted, below = lst.rows[2].session.id, lst.rows[3].session.id
+    key(lst, Qt.Key.Key_Delete)
+    pump()
+    assert page.undo.ids() == {deleted} and len(lst.rows) == n - 1
+    assert lst.hasFocus() and lst.selected_index() == 2 and lst.rows[2].session.id == below
+    assert lst.rows[2].is_selected() and not lst.rows[0].is_selected()
+    # Auto-repeat of a held Delete / Backspace is ignored.
+    for k in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+        QApplication.sendEvent(lst, QKeyEvent(QEvent.Type.KeyPress, k, Qt.KeyboardModifier.NoModifier, "", True))
+    pump()
+    assert page.undo.ids() == {deleted} and lst.rows[2].session.id == below
+    # Deleting the last row selects the new last row.
+    key(lst, Qt.Key.Key_End)
+    key(lst, Qt.Key.Key_Delete)
+    pump()
+    assert lst.selected_index() == len(lst.rows) - 1 == n - 3
+
+
+def test_ctrl_z_undoes_a_delete_from_the_keyboard(ictx: AppContext) -> None:
+    seed_week(ictx)
+    win = show(ictx)
+    win.activateWindow()
+    pump()
+    assert QApplication.activeWindow() is win
+    page = page_of(ictx)
+    lst = page.recent_list
+    lst.setFocus(Qt.FocusReason.TabFocusReason)
+    pump()
+    sid = lst.rows[0].session.id
+    key(lst, Qt.Key.Key_Delete)
+    pump()
+    assert sid in page.undo.ids() and win.toasts.action_text() == "Undo"
+    QTest.keyClick(lst, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+    pump()
+    assert page.undo.ids() == set() and not win.toasts.is_showing()
+    assert sid in [r.session.id for r in lst.rows] and ictx.repo.get_session(sid) is not None
+    assert lst.hasFocus()
 
 
 def test_row_menu_deletes(ictx: AppContext) -> None:
@@ -532,6 +600,11 @@ def test_side_by_side_and_stacked(ictx: AppContext) -> None:
     page = page_of(ictx)
     assert page.is_side_by_side()
     assert page.heatmap_card.geometry().top() == page.top_card.geometry().top()
+    # Titles share a baseline although only "Top projects" has a 28 px toggle in its header.
+    heat_title, top_title = page.heatmap_card.title_label(), page.top_card.title_label()
+    assert heat_title is not None and top_title is not None
+    centre = lambda lbl: lbl.mapTo(page.row, lbl.rect().center()).y()  # noqa: E731
+    assert centre(heat_title) == centre(top_title)
     win_of(ictx).resize(SIDE_BY_SIDE_MIN - 60, 700)
     pump(10)
     assert not page.is_side_by_side()
@@ -547,6 +620,30 @@ def test_kpi_grid_columns(ictx: AppContext) -> None:
     assert page.kpi_grid.columns() == 4 and page.kpi_grid.height() == 108
     page.kpi_grid.resize(700, 108)
     assert page.kpi_grid.columns() == 2 and page.kpi_grid.height() == 108 * 2 + 16
+
+
+@pytest.mark.parametrize("width", [KPI_FOUR_COLUMNS_MIN, 1120])
+def test_kpi_hints_never_truncate_in_four_columns(ictx: AppContext, width: int) -> None:
+    """From the 4-up threshold on, three-digit hints still fit next to their labels."""
+    hints = {"Focus time": "Streak 123 · best 456", "Sessions": "", "Focus score": "Came back 122 times",
+             "Habits": "612 of 840 done"}
+    cards = [StatCard(label) for label in hints]
+    for card, hint in zip(cards, hints.values()):
+        card.set_hint(hint)
+    grid = _KpiGrid(cards)
+    grid.resize(width, grid.height())
+    grid.show()
+    pump()
+    try:
+        assert grid.width() == width and grid.columns() == 4
+        for card in cards:
+            hint = card._hint  # noqa: SLF001
+            assert hint.text() == hint.full_text(), f"{card.label_text()}: {hint.text()!r}"
+        grid.resize(KPI_FOUR_COLUMNS_MIN - 1, grid.height())
+        assert grid.columns() == 2
+    finally:
+        grid.hide()
+        grid.deleteLater()
 
 
 def test_accessibility_names(ictx: AppContext) -> None:
@@ -582,6 +679,39 @@ def test_snapshot_loader_excludes_ids(ictx: AppContext) -> None:
     assert snap.focus_seconds == 135 * 60
     assert ids["mon"] not in [s.id for s in snap.recent]
     assert kit.load_snapshot(ictx, "bogus").range_key == "7d"
+
+
+def test_snapshot_streak_is_all_time_without_loading_all_sessions(ictx: AppContext, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The goal streak covers the whole history (a best streak may predate the range), but a
+    refresh only loads the sessions of the ranges it shows — the history is summed in SQL."""
+    from madhura.core.streaks import day_streak
+
+    ictx.settings.update(daily_goal_minutes=60)
+    old = date(2025, 3, 3)  # a 10-day run long before any range (and the idle header's 120 days)
+    for i in range(10):
+        add_session(ictx, datetime.combine(old + timedelta(days=i), datetime.min.time()).replace(hour=9), 61)
+    late = add_session(ictx, datetime(2026, 10, 14, 2, 30), 60)  # before 04:00 → counts for Tue 13
+    for back in (0, 2):  # Wed 14, Mon 12
+        add_session(ictx, datetime(2026, 10, 14 - back, 9, 0), 60)
+    add_session(ictx, datetime(2026, 10, 11, 9, 0), 90, "abandoned")  # never counts
+    starts: list[datetime] = []
+    real = ictx.repo.sessions_between
+
+    def spy(start: datetime, end: datetime, *a, **kw):  # type: ignore[no-untyped-def]
+        starts.append(start)
+        return real(start, end, *a, **kw)
+
+    monkeypatch.setattr(ictx.repo, "sessions_between", spy)
+    for rk in an.RANGES:
+        snap = kit.load_snapshot(ictx, rk)
+        prev_start, _ = an.period_bounds(an.previous_range_period(rk, TODAY), ictx.day_start_hour())
+        assert starts and min(starts) >= prev_start, rk
+        starts.clear()
+        everything = real(datetime(1970, 1, 1), datetime(2026, 10, 15, 4, 0))
+        assert snap.streak == day_streak(an.goal_dates(everything, 60, 4), TODAY, int(ictx.settings.get("work_days")))
+        assert snap.streak == (3, 10)
+    # Pending undo-deletes are left out of the streak too: without the 02:30 session Tue 13 is unmet.
+    assert kit.load_snapshot(ictx, "7d", {late}).streak == (1, 10)
 
 
 def test_kit_formatting_helpers() -> None:

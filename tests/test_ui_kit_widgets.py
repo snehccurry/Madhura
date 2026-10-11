@@ -153,6 +153,30 @@ def test_link_button(qtbot) -> None:  # type: ignore[no-untyped-def]
     assert got == [1]
 
 
+def test_enter_clicks_a_focused_button(qtbot) -> None:  # type: ignore[no-untyped-def]
+    """Outside a QDialog a QPushButton ignores Return / Enter; ours click like on Space."""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+
+    buttons = [Button("Lock in", "primary"), IconButton("more", "More"), LinkButton("Dismiss")]
+    _host(qtbot, *buttons)
+    for b in buttons:
+        got: list[int] = []
+        b.clicked.connect(lambda *_a, g=got: g.append(1))
+        b.setFocus(Qt.FocusReason.TabFocusReason)
+        QTest.keyClick(b, Qt.Key.Key_Return)
+        QTest.keyClick(b, Qt.Key.Key_Enter, Qt.KeyboardModifier.KeypadModifier)
+        QTest.keyClick(b, Qt.Key.Key_Space)
+        assert len(got) == 3, type(b).__name__
+        QTest.keyClick(b, Qt.Key.Key_Return, Qt.KeyboardModifier.ControlModifier)  # the primary's key
+        held = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return, Qt.KeyboardModifier.NoModifier, "\r", True)
+        QApplication.sendEvent(b, held)  # auto-repeat of a held key: no second click
+        assert len(got) == 3, type(b).__name__
+        b.setEnabled(False)
+        QTest.keyClick(b, Qt.Key.Key_Return)
+        assert len(got) == 3
+
+
 # --------------------------------------------------------------------------- chips
 
 
@@ -214,6 +238,33 @@ def test_segmented_control(qtbot) -> None:  # type: ignore[no-untyped-def]
     assert s.value() == "30 days" and got[-1] == "30 days"
     s.set_value("7 days")
     assert got[-1] == "30 days"
+
+
+def test_segmented_control_key_commit_delay(qtbot) -> None:  # type: ignore[no-untyped-def]
+    """Opt-in for expensive options (theme): arrow runs emit once; clicks and Enter at once."""
+    s = SegmentedControl(["a", "b", "c", "d"], value="a")
+    s.set_key_commit_delay(60)
+    _host(qtbot, s)
+    got: list[object] = []
+    s.valueChanged.connect(got.append)
+    s.setFocus()
+    QTest.keyClick(s, Qt.Key.Key_Right)
+    QTest.keyClick(s, Qt.Key.Key_Right)
+    assert s.value() == "c" and got == []
+    qtbot.waitUntil(lambda: got == ["c"], timeout=1000)
+    QTest.keyClick(s, Qt.Key.Key_End)
+    QTest.keyClick(s, Qt.Key.Key_Return)
+    assert got == ["c", "d"]
+    QTest.keyClick(s, Qt.Key.Key_Left)
+    qtbot.mouseClick(s, Qt.MouseButton.LeftButton, pos=s._segment_rects()[0].center().toPoint())  # noqa: SLF001
+    assert got == ["c", "d", "a"]
+    QTest.keyClick(s, Qt.Key.Key_Right)
+    s.set_value("d")  # an external change drops the pending key change
+    qtbot.wait(120)
+    assert got == ["c", "d", "a"] and s.value() == "d"
+    QTest.keyClick(s, Qt.Key.Key_Home)
+    s.hide()  # leaving the page applies at once
+    assert got == ["c", "d", "a", "a"]
 
 
 def test_day_chips(qtbot) -> None:  # type: ignore[no-untyped-def]
@@ -325,6 +376,80 @@ def test_progress_ring_animates(qtbot, _theme: theme.ThemeManager) -> None:  # t
     assert r.is_breathing()
     r.set_breathing(False)
     assert not r.is_breathing()
+
+
+def test_ring_breathes_only_on_screen(qtbot, _theme: theme.ThemeManager) -> None:  # type: ignore[no-untyped-def]
+    """The paused ring breathes while it can be seen: hidden to the tray / minimized / with
+    reduce-motion on, no frames keep waking the CPU, and it picks up again when shown."""
+    _theme.set_reduce_motion(False)
+    r = ProgressRing(280, 12)
+    r.set_progress(0.6)
+    r.set_text("24:00")
+    r.set_caption("Paused")
+    r.set_breathing(True)  # requested while not yet shown
+    assert r.is_breathing() and not r.is_breath_animating()
+    host = _host(qtbot, r)
+    assert r.is_breath_animating()
+    qtbot.waitUntil(lambda: r.opacity() < 0.95, timeout=3000)
+    host.hide()  # window hidden to the tray (minimize sends the ring a hide event too)
+    assert not r.is_breath_animating() and r.opacity() == 1.0
+    assert r.is_breathing()  # still wanted: resumes on show
+    host.show()
+    assert r.is_breath_animating()
+    _theme.set_reduce_motion(True)
+    assert not r.is_breath_animating() and not r.is_breathing() and r.opacity() == 1.0
+    _theme.set_reduce_motion(False)
+    assert r.is_breath_animating()
+    r.set_breathing(False)
+    assert not r.is_breath_animating() and r.opacity() == 1.0
+
+
+def test_ring_breath_frames_are_throttled(qtbot, _theme: theme.ThemeManager) -> None:  # type: ignore[no-untyped-def]
+    from madhura.ui.widgets.progress_ring import BREATH_FRAME_MS
+
+    _theme.set_reduce_motion(False)
+    r = ProgressRing(280, 12)
+    r.set_progress(0.6)
+    r.set_text("24:00")
+    _host(qtbot, r)
+    paints: list[int] = []
+    original = r.paintEvent
+    r.paintEvent = lambda e: (paints.append(1), original(e))  # type: ignore[method-assign]
+    r.set_breathing(True)
+    assert BREATH_FRAME_MS >= 50  # ≤ 20 fps
+    qtbot.wait(1000)
+    assert 3 <= len(paints) <= 1000 // BREATH_FRAME_MS + 3, len(paints)
+
+
+def test_breathing_ring_face_matches_the_direct_paint(qtbot, _theme: theme.ThemeManager) -> None:  # type: ignore[no-untyped-def]
+    """While breathing, arc + text come from a cached layer: it must look like the direct paint."""
+    _theme.set_reduce_motion(False)
+    r = ProgressRing(280, 12)
+    r.set_progress(0.6)
+    r.set_text("24:00")
+    r.set_caption("Paused")
+    r.set_color(theme.palette().text_subtle)
+    _host(qtbot, r)
+    r._opacity = 0.8  # noqa: SLF001 - a breathing frame, painted directly
+    direct = r.grab().toImage()
+    r.set_breathing(True)
+    r._breath_timer.blockSignals(True)  # noqa: SLF001 - freeze the breath
+    r._opacity = 0.8  # noqa: SLF001
+    cached = r.grab().toImage()
+    assert set(r._layers) == {"track", "face"}  # noqa: SLF001
+    diff = 0
+    for y in range(0, direct.height(), 2):
+        for x in range(0, direct.width(), 2):
+            a, b = direct.pixelColor(x, y), cached.pixelColor(x, y)
+            diff = max(diff, abs(a.red() - b.red()), abs(a.green() - b.green()), abs(a.blue() - b.blue()), abs(a.alpha() - b.alpha()))
+    assert diff <= 6, diff
+    r.set_progress(0.5)  # the face layer follows changes
+    key_before = r._layers["face"][0]  # noqa: SLF001
+    r.grab()
+    assert r._layers["face"][0] != key_before  # noqa: SLF001
+    r._breath_timer.blockSignals(False)  # noqa: SLF001
+    r.set_breathing(False)
+    assert not r._layers and r.opacity() == 1.0  # noqa: SLF001
 
 
 # --------------------------------------------------------------------------- inputs
@@ -570,6 +695,9 @@ def test_inline_banner(qtbot) -> None:  # type: ignore[no-untyped-def]
     b = InlineBanner("warning", "You were away 1h 52m", [("Resume", lambda: hits.append("r")), ("Abandon", lambda: hits.append("a"))], dismissible=True)
     _host(qtbot, b, width=800)
     assert not b.is_stacked()
+    first, second = b.action_buttons()
+    # visibly separate actions ("Resume   Abandon"), not one run of text
+    assert second.geometry().left() - first.geometry().right() - 1 >= 12
     dismissed: list[int] = []
     b.dismissed.connect(lambda: dismissed.append(1))
     qtbot.mouseClick(b.action_buttons()[1], Qt.MouseButton.LeftButton)

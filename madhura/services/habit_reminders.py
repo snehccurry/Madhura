@@ -195,8 +195,10 @@ class HabitReminderService(QObject):
             sessions = ctx.repo.sessions_between(start, end)
             now = ctx.clock.now().replace(microsecond=0)
             marked: list[int] = []
+            dsh = ctx.day_start_hour()
             for h in habits:
-                created = hcore.created_date(h)
+                # a day's grace before creation: the session may have begun the logical day before
+                created = hcore.created_date(h, day_start_hour=dsh)
                 if h.id in logged or (created is not None and d < created - timedelta(days=1)):
                     continue
                 if hcore.auto_satisfied(h, hcore.focused_minutes(sessions, h.project)):
@@ -439,9 +441,10 @@ class HabitReminderService(QObject):
         ctx = self._ctx
         today = ctx.today()
         try:
-            created = hcore.created_date(habit) or today
+            dsh = ctx.day_start_hour()
+            created = hcore.created_date(habit, day_start_hour=dsh) or today
             logs = ctx.repo.habit_logs_between(min(created, today) - timedelta(days=1), today)
-            current, _best = hcore.habit_streak(habit, logs, today)
+            current, _best = hcore.habit_streak(habit, logs, today, day_start_hour=dsh)
         except sqlite3.Error:
             current = 0
         name = habit.name if len(habit.name) <= 28 else habit.name[:27].rstrip() + "…"

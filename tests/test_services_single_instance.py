@@ -104,3 +104,32 @@ def test_lock_held_but_no_server_fails(qapp, enabled, data_dir: Path) -> None:
         assert out.strip() == "failed"
     finally:
         holder.release()
+
+
+def test_second_launch_waits_for_a_starting_primary(qtbot, enabled, data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The primary holds the lock but is not listening yet (still building QApplication): a racing
+    launch must keep trying instead of reporting "did not respond"."""
+    from madhura.services import single_instance as si
+
+    holder = SingleInstance()
+    shows: list[bool] = []
+    holder.show_requested.connect(lambda: shows.append(True))
+    try:
+        assert holder.acquire() is InstanceStatus.PRIMARY
+        holder._server.close()
+        holder._server.deleteLater()
+        holder._server = None  # lock taken, not listening yet
+        waits: list[float] = []
+
+        def primary_comes_up(seconds: float) -> None:
+            waits.append(seconds)
+            if len(waits) == 2:
+                assert holder.listen()
+
+        monkeypatch.setattr(si.time, "sleep", primary_comes_up)
+        second = SingleInstance()
+        assert second.acquire() is InstanceStatus.SIGNALED
+        assert len(waits) == 2
+        qtbot.waitUntil(lambda: shows == [True], timeout=5_000)
+    finally:
+        holder.release()

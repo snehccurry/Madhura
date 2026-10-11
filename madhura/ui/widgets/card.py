@@ -122,6 +122,11 @@ class Card(QWidget):
         self.header_layout.insertWidget(idx, widget, 0, Qt.AlignmentFlag.AlignVCenter)
         self._sync_header()
 
+    def set_header_min_height(self, height: int) -> None:
+        """Minimum height of the header row. Side-by-side cards whose headers differ (one has a
+        28 px control as its action) use it to put their titles on the same baseline."""
+        self._header.setMinimumHeight(max(0, int(height)))
+
     def _sync_header(self) -> None:
         visible = any(
             w is not None and not w.isHidden() for w in (self._title_label, self._subtitle_label, self._action)

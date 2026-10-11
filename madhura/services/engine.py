@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import math
 import sqlite3
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -102,6 +103,33 @@ class FocusEngine(QObject):
         self._timer.setSingleShot(True)
         self._timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._timer.timeout.connect(self.poll)
+        self._away_probe: Callable[[], float | None] | None = None
+
+    def set_away_probe(self, probe: Callable[[], float | None] | None) -> None:
+        """Install a callable returning the epoch since which the user has been away from the
+        computer (input idle), or None (``AwayService`` provides it where idle time is known).
+
+        It is consulted synchronously so away time is never credited: a session that reaches its
+        end while the user is away pauses where they left instead of completing, and a
+        sleep/suspend gap closes the focus segment there instead of at the last poll (both emit
+        ``away_detected`` with the whole time away).
+        """
+        self._away_probe = probe
+
+    def _away_since(self, limit: float) -> float | None:
+        """The away probe's epoch clamped to the running segment; None unless it is before *limit*."""
+        probe = self._away_probe
+        if probe is None or self._segment_start is None:
+            return None
+        try:
+            at = probe()
+        except Exception:  # a broken probe must never stop the engine
+            log.exception("away probe failed")
+            return None
+        if not _num(at):
+            return None
+        at = max(float(at), self._segment_start)  # type: ignore[arg-type]
+        return at if at < limit else None
 
     # ================================================================== fields
 
@@ -674,7 +702,7 @@ class FocusEngine(QObject):
         gen = self._bump()
         self._last_poll = now
         self._arm()
-        log.info("Gap of %.0f s detected during focus; session paused", gap)
+        log.info("Away for %.0f s during focus; session paused", gap)
         self._emit_state()
         if self._gen != gen:
             return
@@ -710,7 +738,9 @@ class FocusEngine(QObject):
             self._persist(now)
         elif dt > SUSPEND_GAP_SECONDS:
             if state is EngineState.FOCUS:
-                self._suspend_to_paused(self._last_poll, dt, now)
+                at = self._away_since(self._last_poll)
+                at = self._last_poll if at is None else at
+                self._suspend_to_paused(at, now - at, now)
                 return
             if state is EngineState.BREAK and self._break_start is not None:
                 if now >= self._break_start + self._break_total:
@@ -725,6 +755,11 @@ class FocusEngine(QObject):
 
         if state is EngineState.FOCUS and self._segment_start is not None:
             if self._focused_before + (now - self._segment_start) >= self._planned:
+                away = self._away_since(self._segment_start + self._planned - self._focused_before)
+                if away is not None:
+                    # Reached the end while the user is away: pause where they left, credit nothing more.
+                    self._suspend_to_paused(away, now - away, now)
+                    return
                 self._complete_naturally(now)
                 return
         elif state is EngineState.BREAK and self._break_start is not None:

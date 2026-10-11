@@ -17,6 +17,7 @@ import getpass
 import hashlib
 import logging
 import os
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QCoreApplication, QLockFile, QObject, Signal
@@ -32,6 +33,14 @@ log = logging.getLogger(__name__)
 _CONNECT_MS = 500
 _IO_MS = 500
 _LOCK_WAIT_MS = 100
+#: The primary takes the lock before QApplication exists and listens only after it is built; a
+#: launch racing that startup (autostart vs. a click at login) keeps trying this long.
+_CONNECT_DEADLINE_MS = 2500
+_CONNECT_RETRY_MS = 100
+_NOT_LISTENING_YET = (
+    QLocalSocket.LocalSocketError.ServerNotFoundError,
+    QLocalSocket.LocalSocketError.ConnectionRefusedError,
+)
 
 
 class InstanceStatus(ValueEnum):
@@ -116,11 +125,26 @@ class SingleInstance(QObject):
         log.error("Lock held by another instance that did not answer on %s", self.server_name)
         return InstanceStatus.FAILED
 
+    def _connect(self) -> QLocalSocket | None:
+        """Connect to the primary, retrying while it is still starting up (lock taken, not yet
+        listening) until :data:`_CONNECT_DEADLINE_MS`."""
+        deadline = time.monotonic() + _CONNECT_DEADLINE_MS / 1000.0
+        while True:
+            sock = QLocalSocket()
+            sock.connectToServer(self.server_name)
+            if sock.waitForConnected(_CONNECT_MS):
+                return sock
+            error = sock.error()
+            sock.abort()
+            if error not in _NOT_LISTENING_YET or time.monotonic() >= deadline:
+                log.debug("Could not reach the running instance: %s", error)
+                return None
+            time.sleep(_CONNECT_RETRY_MS / 1000.0)
+
     def signal_existing(self) -> bool:
         """Connect to the primary, read ``pid:<n>``, allow it to take focus, send ``show``."""
-        sock = QLocalSocket()
-        sock.connectToServer(self.server_name)
-        if not sock.waitForConnected(_CONNECT_MS):
+        sock = self._connect()
+        if sock is None:
             return False
         try:
             pid = None
@@ -175,8 +199,13 @@ class SingleInstance(QObject):
             self._buffers[id(sock)] = b""
             sock.readyRead.connect(lambda s=sock: self._on_ready_read(s))
             sock.disconnected.connect(lambda s=sock: self._drop(s))
-            sock.write(f"pid:{os.getpid()}\n".encode())
-            sock.flush()
+            # A launch that raced our startup (listening, event loop not running yet) has already
+            # written "show" and hung up: read it before the pid write fails and drops the socket.
+            if sock.waitForReadyRead(0) or sock.bytesAvailable():
+                self._on_ready_read(sock)
+            if sock.state() == QLocalSocket.LocalSocketState.ConnectedState:
+                sock.write(f"pid:{os.getpid()}\n".encode())
+                sock.flush()
 
     def _on_ready_read(self, sock: QLocalSocket) -> None:
         data = self._buffers.get(id(sock), b"") + bytes(sock.readAll())
@@ -185,7 +214,8 @@ class SingleInstance(QObject):
             if line.strip() == b"show":
                 log.info("Another launch asked us to show the window")
                 self.show_requested.emit()
-        self._buffers[id(sock)] = data[-256:]
+        if sock in self._clients:
+            self._buffers[id(sock)] = data[-256:]
 
     def _drop(self, sock: QLocalSocket) -> None:
         if sock in self._clients:

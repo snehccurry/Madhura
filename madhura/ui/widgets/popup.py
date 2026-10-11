@@ -364,8 +364,13 @@ class FloatingPanel(QWidget):
         return max(h, 2 * (self.shadow_margin + self.padding))
 
     def card_size(self) -> QSize:
-        """Visual card size (excludes the shadow margin)."""
-        return QSize(self._card_width, self.desired_height() - 2 * self.shadow_margin)
+        """Visual card size (excludes the shadow margin).
+
+        Never narrower than the content's minimum: Qt widens a window to its minimum size, so a
+        card laid out at the nominal width would otherwise run past the screen's right edge.
+        """
+        minimum = self.minimumSizeHint().width() - 2 * self.shadow_margin
+        return QSize(max(self._card_width, minimum), self.desired_height() - 2 * self.shadow_margin)
 
     def card_rect(self) -> QRect:
         """Card rectangle in widget coordinates."""

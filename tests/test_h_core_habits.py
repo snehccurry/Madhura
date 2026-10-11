@@ -93,6 +93,28 @@ def test_created_date_and_logs_by_date_filters_other_habits() -> None:
     assert hc.logs_by_date(h, mixed) == {WED: "done"}
 
 
+def test_created_date_is_the_logical_day() -> None:
+    # 01:30 on Thu 15 Oct with a 04:00 day start is still logical Wednesday
+    h = habit(created=datetime(2026, 10, 15, 1, 30))
+    assert hc.created_date(h, day_start_hour=4) == WED
+    assert hc.created_date(h) == date(2026, 10, 15)  # midnight day start: the calendar date
+    assert hc.created_date(habit(created=datetime(2026, 10, 15, 4, 0)), day_start_hour=4) == date(2026, 10, 15)
+
+
+def test_habit_created_after_midnight_before_day_start_belongs_to_that_logical_day() -> None:
+    weekdays = habit(days=31, created=datetime(2026, 10, 15, 1, 30))  # logical Wed with day start 4
+    # not done yet: today is pending, not "unscheduled" as if the habit did not exist yet
+    assert hc.day_state(weekdays, {}, WED, WED, day_start_hour=4) == "pending"
+    assert dict(hc.last_7(weekdays, [], WED, day_start_hour=4))[WED] == "pending"
+    assert dict(hc.last_7(weekdays, [], WED, day_start_hour=4))[days_back(1)] == "unscheduled"  # before creation
+    assert hc.habit_streak(weekdays, logs(1, {WED: "done"}), WED, day_start_hour=4) == (1, 1)
+    # the next morning: Wednesday counts as a missed day of its own, Tuesday still doesn't
+    thu = WED + timedelta(days=1)
+    assert hc.day_state(weekdays, {}, WED, thu, day_start_hour=4) == "missed"
+    assert hc.missed_yesterday(weekdays, [], thu, day_start_hour=4) is True
+    assert hc.missed_yesterday(weekdays, [], thu) is False  # calendar creation date = Thursday
+
+
 # --------------------------------------------------------------------------- last 7 days
 
 

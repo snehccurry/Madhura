@@ -160,3 +160,21 @@ def test_legacy_scan_is_bounded(tmp_path: Path) -> None:
     (root / "node_modules" / "habits.json").write_text(legacy, encoding="utf-8")
     assert paths.legacy_habits_candidates([root], max_dirs_per_root=10) == []
     assert paths.legacy_habits_candidates([root]) == [root / "d29" / "habits.json"]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="XDG user-dirs")
+def test_legacy_habits_found_on_redirected_desktop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Desktop may live elsewhere (OneDrive Known Folder Move on Windows, ~/Schreibtisch on a
+    German Linux desktop): use the folder the OS reports, not only ~/Desktop."""
+    home = tmp_path / "home"
+    desktop = home / "Schreibtisch"
+    (desktop / "Madhura-v1").mkdir(parents=True)
+    legacy = desktop / "Madhura-v1" / "habits.json"
+    legacy.write_text('{"_default": {"1": {"title": "x", "time": "12:00"}}}', encoding="utf-8")
+    config = home / ".config"
+    config.mkdir()
+    (config / "user-dirs.dirs").write_text('XDG_DESKTOP_DIR="$HOME/Schreibtisch"\n', encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config))
+    monkeypatch.chdir(tmp_path)
+    assert paths.legacy_habits_candidates() == [legacy]

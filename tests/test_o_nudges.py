@@ -324,9 +324,41 @@ def test_firm_repeats_unless_the_user_is_on_the_focus_page(octx: AppContext, mon
     win.active = True  # the user is looking at the banner
     wait(octx, GRACE)
     assert win.called("show_main") == 2
-    win.page = "settings"
+    win.page = "settings"  # still in Madhura, elsewhere: the banner waits on Focus
     wait(octx, GRACE)
-    assert win.called("show_main") == 3
+    assert win.called("show_main") == 2 and win.page == "settings" and win.nudge_banner
+    win.active = False  # buried again
+    wait(octx, GRACE)
+    assert win.called("show_main") == 3 and win.page == "focus"
+
+
+def test_firm_never_switches_the_page_under_an_active_user(octx: AppContext, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
+    win: FakeWindowController = octx.window  # type: ignore[assignment]
+    win.visible = win.active = True
+    win.page = "habits"
+    win.sheets.append(object())  # e.g. the habit editor, focus in its name field
+    octx.settings.update(nudge_mode="firm")
+    set_idle(monkeypatch, octx, None)  # Linux/X11: no input-idle gate
+    for _ in range(3):
+        wait(octx, GRACE)
+    assert win.called("show_main") == 0
+    assert win.page == "habits" and win.sheets
+    assert win.nudge_banner and octx.nudges.banner_visible  # waiting on the Focus page
+
+
+def test_firm_waits_while_a_sheet_is_open_in_the_inactive_window(octx: AppContext, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
+    win: FakeWindowController = octx.window  # type: ignore[assignment]
+    win.visible, win.active = True, False
+    win.page = "habits"
+    win.sheets.append(object())
+    octx.settings.update(nudge_mode="firm")
+    set_idle(monkeypatch, octx, None)
+    wait(octx, GRACE)
+    wait(octx, GRACE)
+    assert win.called("show_main") == 0 and win.page == "habits" and not win.nudge_banner
+    win.sheets.clear()  # the sheet is closed: the next round raises on Focus
+    wait(octx, GRACE)
+    assert win.called("show_main") == 1 and win.page == "focus" and win.nudge_banner
 
 
 def test_firm_banner_hidden_by_snooze_and_mode_change(octx: AppContext, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811

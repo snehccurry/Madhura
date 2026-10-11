@@ -8,10 +8,11 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 import pytest
+from PySide6.QtCore import Qt
 
 from madhura.context import AppContext
 from madhura.ui.overlays.wrap_up import WrapUpSheet, next_day_word, open_wrap_up
-from test_i_support import TODAY, add_session, ictx, no_summary, pump, show, win_of  # noqa: F401
+from test_i_support import TODAY, add_session, ictx, key, no_summary, pump, show, win_of  # noqa: F401
 
 THU = date(2026, 10, 15)
 
@@ -120,6 +121,23 @@ def test_drop_and_undo(wctx: AppContext) -> None:
     assert titles(sheet.task_rows) == ["Old one", "Slides", "Report"]
 
 
+def test_undo_after_the_sheet_closed(wctx: AppContext) -> None:
+    """The Undo toast outlives the sheet, which is deleted once closed: undo still restores the
+    task, without touching the dead sheet."""
+    from PySide6.QtCore import QCoreApplication, QEvent
+    from shiboken6 import isValid
+
+    sheet = open_sheet(wctx)
+    tid = sheet.task_rows[2].task_id
+    sheet.drop_task(tid)
+    sheet.close_sheet()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    assert not isValid(sheet)
+    win_of(wctx).toasts.trigger_action()  # must not raise (RuntimeError: C++ object deleted)
+    pump()
+    assert [t.title for t in wctx.repo.tasks_for_date(TODAY) if t.title == "Report"] == ["Report"]
+
+
 def test_row_buttons_are_wired(wctx: AppContext) -> None:
     sheet = open_sheet(wctx)
     row = sheet.task_rows[0]
@@ -209,14 +227,61 @@ def test_existing_note_prefilled_and_clearable(wctx: AppContext) -> None:
     assert wctx.repo.get_day_note(TODAY) is None
 
 
-def test_not_now_discards_fields(wctx: AppContext) -> None:
+def test_not_now_keeps_typed_fields_but_not_done_for_today(wctx: AppContext) -> None:
     sheet = open_sheet(wctx)
+    sheet.went_well.set_text("Kept the phone away")
     sheet.first_block.set_text("Something")
     sheet.cancel_button.click()
     pump(10)
-    assert not win_of(wctx).has_sheet()
+    win = win_of(wctx)
+    assert not win.has_sheet()
+    assert wctx.repo.get_day_note(TODAY) == "Kept the phone away"
+    first = wctx.repo.tasks_for_date(THU)[0]
+    assert (first.title, first.minutes, first.position) == ("Something", 60, 0)
+    assert [t.title for t in wctx.repo.tasks_for_date(THU)] == ["Something", "Tomorrow's existing"]
+    assert wctx.nudges is not None and not wctx.nudges.is_done_for_today  # nudges stay on
+    assert win.toasts.text() == "Added ‘Something’ to tomorrow's Up next" and win.toasts.action_text() == "Undo"
+    win.toasts.trigger_action()  # "I meant to throw it away"
     assert [t.title for t in wctx.repo.tasks_for_date(THU)] == ["Tomorrow's existing"]
+
+
+def test_esc_keeps_typed_fields(wctx: AppContext) -> None:
+    sheet = open_sheet(wctx)
+    sheet.first_block.set_text("Review the PR")
+    sheet.first_block.line_edit.setFocus()
+    key(sheet.first_block.line_edit, Qt.Key.Key_Escape)
+    pump(10)
+    assert not win_of(wctx).has_sheet()
+    assert [t.title for t in wctx.repo.tasks_for_date(THU)] == ["Review the PR", "Tomorrow's existing"]
     assert wctx.nudges is not None and not wctx.nudges.is_done_for_today
+
+
+def test_closing_untouched_saves_nothing(wctx: AppContext) -> None:
+    wctx.repo.set_day_note(TODAY, "Already noted")
+    seen: list[str] = []
+    wctx.events.data_changed.connect(seen.append)
+    sheet = open_sheet(wctx)
+    shown_before = win_of(wctx).toasts.is_showing()
+    sheet.cancel_button.click()
+    pump(10)
+    assert wctx.repo.get_day_note(TODAY) == "Already noted"
+    assert [t.title for t in wctx.repo.tasks_for_date(THU)] == ["Tomorrow's existing"]
+    assert "tasks" not in seen and win_of(wctx).toasts.is_showing() == shown_before
+
+
+def test_save_inputs_is_idempotent(wctx: AppContext) -> None:
+    """Saved early (e.g. at logoff) and again later: the one first-block task is updated, not doubled."""
+    sheet = open_sheet(wctx)
+    sheet.first_block.set_text("Draft")
+    created = sheet.save_inputs()
+    assert created is not None and sheet.save_inputs() is None
+    sheet.first_block.set_text("Draft the intro")
+    sheet.cycle_first_minutes()
+    sheet.shutdown()
+    pump(10)
+    tasks = wctx.repo.tasks_for_date(THU)
+    assert [(t.id, t.title, t.minutes) for t in tasks[:1]] == [(created, "Draft the intro", 90)]
+    assert len(tasks) == 2
 
 
 def test_enter_in_first_block_completes(wctx: AppContext) -> None:

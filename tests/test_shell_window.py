@@ -286,6 +286,131 @@ def test_escape_blurs_focus(shell: AppContext) -> None:  # noqa: F811
     assert field.hasFocus()
     QApplication.sendEvent(win, QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier))
     assert not field.hasFocus()
+    assert QApplication.focusWidget() is win.page("focus")  # blurred onto the page, not to nowhere
+
+
+def test_page_switch_closes_the_custom_length_popover(shell: AppContext) -> None:  # noqa: F811
+    """Ctrl+3 with the Custom popover open (focus in its stepper): the popover goes with the
+    Focus page and focus lands on the new page."""
+    win = _win(shell)
+    _activate(win)
+    plan = win.page("focus").idle_view.plan_card
+    plan.open_custom_duration()
+    pop = plan.custom_popover()
+    assert pop is not None and pop.is_open() and plan.custom_stepper().hasFocus()
+    _shortcut(win, "Ctrl+3").activated.emit()
+    assert win.current_page() == "insights"
+    assert plan.custom_popover() is None and not pop.isVisible()
+    assert QApplication.focusWidget() is win.page("insights")
+
+
+def _press(win: MainWindow, key: Qt.Key) -> None:
+    """A key press as the platform delivers it: to the focus widget, else to the window."""
+    from PySide6.QtTest import QTest
+
+    QTest.keyClick(QApplication.focusWidget() or win, key)
+
+
+def test_keyboard_focus_starts_on_the_page(shell: AppContext) -> None:  # noqa: F811
+    """Activation must not park focus on the first Tab stop (the "Focus" sidebar item), where
+    Space would do nothing (or press the item)."""
+    win = _win(shell)
+    _activate(win)
+    assert QApplication.focusWidget() is win.page("focus")
+
+
+def test_space_still_pauses_after_escape(shell: AppContext) -> None:  # noqa: F811
+    win = _win(shell)
+    _activate(win)
+    engine = shell.engine
+    engine.start("Write the intro", 25)
+    QApplication.processEvents()
+    win.page("focus").setFocus(Qt.FocusReason.OtherFocusReason)
+    _press(win, Qt.Key.Key_Space)
+    assert str(engine.state) == "paused"
+    _press(win, Qt.Key.Key_Escape)
+    assert QApplication.focusWidget() is win.page("focus")
+    _press(win, Qt.Key.Key_Space)
+    assert str(engine.state) == "focus"
+
+
+def test_enter_on_focused_buttons_and_the_abandon_sheet(shell: AppContext) -> None:  # noqa: F811
+    """Enter clicks a focused button ("Lock in"); the destructive Abandon sheet opens on its
+    Cancel ("Keep going"), so Enter or Space there keeps the session."""
+    win = _win(shell)
+    _activate(win)
+    engine = shell.engine
+    plan = win.page("focus").idle_view.plan_card
+    plan.task_field.set_text("Write the intro")
+    plan.lock_in.setFocus(Qt.FocusReason.TabFocusReason)
+    _press(win, Qt.Key.Key_Return)
+    assert str(engine.state) == "focus"
+    advance(shell, 600)
+    for key in (Qt.Key.Key_Return, Qt.Key.Key_Space):
+        win.page("focus").active_view.confirm_abandon()
+        for _ in range(3):
+            QApplication.processEvents()
+        sheet = win.sheet_host.current()
+        assert sheet is not None and QApplication.focusWidget() is sheet.cancel_button  # type: ignore[attr-defined]
+        _press(win, key)
+        assert not win.has_sheet() and str(engine.state) == "focus", key
+
+
+def test_space_resumes_a_session_restored_paused(qapp: QApplication, data_dir: Path, fake_clock: FakeClock) -> None:
+    """Quit mid-session pauses it; on the next launch Space must resume it straight away."""
+    ctx = make_shell(qapp, data_dir, fake_clock)
+    ctx.engine.start("Write the intro", 25)
+    advance(ctx, 120)
+    ctx.engine.pause()  # what quit_app() does to a running session
+    dispose_shell(ctx, qapp)
+    ctx2 = make_shell(qapp, data_dir, fake_clock)
+    try:
+        win = _win(ctx2)
+        assert str(ctx2.engine.state) == "paused"
+        _activate(win)
+        assert QApplication.focusWidget() is win.page("focus")
+        _press(win, Qt.Key.Key_Space)
+        assert str(ctx2.engine.state) == "focus"
+    finally:
+        dispose_shell(ctx2, qapp)
+
+
+def test_focus_returns_to_the_page_when_its_widget_vanished_while_hidden(tray_shell: AppContext) -> None:  # noqa: F811
+    win = _win(tray_shell)
+    _activate(win)
+    field = win.pages["focus"].idle_view.plan_card.task_field.line_edit
+    field.setFocus()
+    win.hide_main()  # to the tray
+    QApplication.processEvents()
+    assert not win.isVisible()
+    win.pages["focus"].idle_view.hide()  # e.g. a session started from the tray swapped the views
+    win.show_main(activate=True)
+    QApplication.processEvents()
+    # The widget activation gives focus to (offscreen does not re-activate a re-shown window).
+    assert win.focusWidget() is win.page("focus"), win.focusWidget()
+    win.pages["focus"].idle_view.show()
+
+
+def test_toasts_are_centred_on_the_page_area(shell: AppContext) -> None:  # noqa: F811
+    """Centred under the page column, not under page + sidebar (104 px off at 1280)."""
+    win = _win(shell)
+    win.resize(1280, 800)
+    win.show_main()
+    QApplication.processEvents()
+    win.show_toast("Task deleted", "info", "Undo", lambda: None)
+    toast = win.toasts.widget()
+
+    def centres() -> tuple[int, int]:
+        stack_centre = win.stack.mapTo(win, win.stack.rect().center()).x()
+        return toast.geometry().center().x(), stack_centre
+
+    t, s = centres()
+    assert abs(t - s) <= 1 and abs(t - win.width() // 2) > 50
+    win.resize(900, 700)  # the sidebar collapses to its rail: the toast follows the page
+    QApplication.processEvents()
+    assert win.sidebar.is_collapsed()
+    t, s = centres()
+    assert abs(t - s) <= 1
 
 
 def test_toasts(shell: AppContext) -> None:  # noqa: F811

@@ -1,7 +1,8 @@
 """Pure habit logic (spec §1.8): scheduling, streaks, the last-7-days strip, due status, grouping.
 
-No Qt and no wall clock: callers pass ``today`` (use ``ctx.today()``, the *logical* date) and
-``now`` (``ctx.clock.now()``). Weekday masks use Mon = bit 0 … Sun = bit 6.
+No Qt and no wall clock: callers pass ``today`` (use ``ctx.today()``, the *logical* date),
+``now`` (``ctx.clock.now()``) and ``day_start_hour`` (``ctx.day_start_hour()``; a habit created
+before the day start belongs to the previous logical day). Weekday masks use Mon = bit 0 … Sun = bit 6.
 
 Day states used across the habits UI:
 
@@ -87,13 +88,16 @@ def is_scheduled(habit: Habit, d: date) -> bool:
     return bool(int(habit.days or 0) & _ALL_DAYS & (1 << d.weekday()))
 
 
-def created_date(habit: Habit) -> date | None:
-    """Calendar date the habit was created (days before it never count as missed)."""
+def created_date(habit: Habit, *, day_start_hour: int = 0) -> date | None:
+    """Logical date the habit was created (days before it never count as missed).
+
+    A habit created at 01:30 with a 04:00 day start belongs to the previous logical day.
+    """
     created = habit.created_at
     if created is None:
         return None
     if isinstance(created, datetime):
-        return created.date()
+        return logical_date(created, day_start_hour)
     return created
 
 
@@ -106,30 +110,31 @@ def logs_by_date(habit: Habit, logs: Iterable[HabitLog]) -> dict[date, str]:
     return out
 
 
-def _before_creation(habit: Habit, d: date) -> bool:
-    created = created_date(habit)
+def _before_creation(habit: Habit, d: date, day_start_hour: int = 0) -> bool:
+    created = created_date(habit, day_start_hour=day_start_hour)
     return created is not None and d < created
 
 
-def day_state(habit: Habit, by_date: Mapping[date, str], d: date, today: date) -> str:
+def day_state(habit: Habit, by_date: Mapping[date, str], d: date, today: date, *, day_start_hour: int = 0) -> str:
     """State of *habit* on *d* (see the module docstring). Logs always win over the schedule."""
     status = by_date.get(d)
     if status in ("done", "skipped"):
         return status
-    if d > today or not is_scheduled(habit, d) or _before_creation(habit, d):
+    if d > today or not is_scheduled(habit, d) or _before_creation(habit, d, day_start_hour):
         return "unscheduled"
     if d == today:
         return "pending"
     return "missed"
 
 
-def last_7(habit: Habit, logs: Iterable[HabitLog], today: date) -> list[tuple[date, str]]:
+def last_7(habit: Habit, logs: Iterable[HabitLog], today: date, *, day_start_hour: int = 0) -> list[tuple[date, str]]:
     """``[(date, state)]`` for the 7 days ending *today*, oldest first."""
     by_date = logs_by_date(habit, logs)
-    return [(d, day_state(habit, by_date, d, today)) for d in (today - timedelta(days=i) for i in range(6, -1, -1))]
+    days = (today - timedelta(days=i) for i in range(6, -1, -1))
+    return [(d, day_state(habit, by_date, d, today, day_start_hour=day_start_hour)) for d in days]
 
 
-def habit_streak(habit: Habit, logs: Iterable[HabitLog], today: date) -> tuple[int, int]:
+def habit_streak(habit: Habit, logs: Iterable[HabitLog], today: date, *, day_start_hour: int = 0) -> tuple[int, int]:
     """``(current, best)`` run of consecutive *scheduled* days marked done.
 
     'skipped' days are neutral, unscheduled days are ignored (even when done), days before the
@@ -137,7 +142,7 @@ def habit_streak(habit: Habit, logs: Iterable[HabitLog], today: date) -> tuple[i
     streak ends today (if done) or yesterday.
     """
     by_date = logs_by_date(habit, logs)
-    start = created_date(habit) or today
+    start = created_date(habit, day_start_hour=day_start_hour) or today
     if by_date:
         start = min(start, min(by_date))
     start = min(start, today)
@@ -150,7 +155,7 @@ def habit_streak(habit: Habit, logs: Iterable[HabitLog], today: date) -> tuple[i
             if status == "done":
                 run += 1
                 best = max(best, run)
-            elif status == "skipped" or d == today or _before_creation(habit, d):
+            elif status == "skipped" or d == today or _before_creation(habit, d, day_start_hour):
                 pass
             else:
                 run = 0
@@ -167,7 +172,7 @@ def previous_scheduled_day(habit: Habit, d: date, limit: int = 7) -> date | None
     return None
 
 
-def missed_yesterday(habit: Habit, logs: Iterable[HabitLog], today: date) -> bool:
+def missed_yesterday(habit: Habit, logs: Iterable[HabitLog], today: date, *, day_start_hour: int = 0) -> bool:
     """"Never miss twice": scheduled today, nothing logged today, and the previous scheduled day
     (yesterday for a daily habit) was missed — not done, not skipped, not before creation."""
     if not is_scheduled(habit, today):
@@ -176,7 +181,7 @@ def missed_yesterday(habit: Habit, logs: Iterable[HabitLog], today: date) -> boo
     if today in by_date:
         return False
     prev = previous_scheduled_day(habit, today)
-    if prev is None or _before_creation(habit, prev):
+    if prev is None or _before_creation(habit, prev, day_start_hour):
         return False
     return prev not in by_date
 

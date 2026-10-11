@@ -13,7 +13,6 @@ Responsibilities (spec §5.1, §5.2, §7.4, §8, §1.13):
 
 from __future__ import annotations
 
-import importlib
 import logging
 import sqlite3
 from collections.abc import Callable, Iterator, Mapping
@@ -30,7 +29,7 @@ from madhura.ui.pages import PAGE_KEYS
 from madhura.ui.shortcuts_sheet import ShortcutsSheet
 from madhura.ui.sidebar import COLLAPSE_BELOW, Sidebar
 from madhura.ui.widgets.empty_state import EmptyState
-from madhura.ui.widgets.sheet import SheetContent, SheetHost
+from madhura.ui.widgets.sheet import SheetContent, SheetHost, inside_floating
 from madhura.ui.widgets.toast import ToastHost
 
 if TYPE_CHECKING:
@@ -48,11 +47,41 @@ PAGE_FADE_MS = 160
 _TITLE_STRIP = 40  # px of the window top that must stay reachable on some screen
 _MIN_VISIBLE = 120
 
-_PAGE_CLASSES: dict[str, tuple[str, str]] = {
-    "focus": ("madhura.ui.pages.focus_page", "FocusPage"),
-    "habits": ("madhura.ui.pages.habits_page", "HabitsPage"),
-    "insights": ("madhura.ui.pages.insights_page", "InsightsPage"),
-    "settings": ("madhura.ui.pages.settings_page", "SettingsPage"),
+# Pages are imported lazily (startup only pays for the Focus page), but through literal import
+# statements: a frozen build's import analysis (PyInstaller) follows those, not a module name
+# handed to importlib, and would otherwise leave every page out of the bundle.
+
+
+def _focus_page(ctx: AppContext) -> QWidget:
+    from madhura.ui.pages.focus_page import FocusPage
+
+    return FocusPage(ctx)
+
+
+def _habits_page(ctx: AppContext) -> QWidget:
+    from madhura.ui.pages.habits_page import HabitsPage
+
+    return HabitsPage(ctx)
+
+
+def _insights_page(ctx: AppContext) -> QWidget:
+    from madhura.ui.pages.insights_page import InsightsPage
+
+    return InsightsPage(ctx)
+
+
+def _settings_page(ctx: AppContext) -> QWidget:
+    from madhura.ui.pages.settings_page import SettingsPage
+
+    return SettingsPage(ctx)
+
+
+#: Page key → page factory.
+_PAGE_FACTORIES: dict[str, Callable[[AppContext], QWidget]] = {
+    "focus": _focus_page,
+    "habits": _habits_page,
+    "insights": _insights_page,
+    "settings": _settings_page,
 }
 
 
@@ -149,10 +178,13 @@ class MainWindow(QMainWindow):
 
         self.sheet_host = SheetHost(central)
         self.sheet_host.activeChanged.connect(self._on_sheet_active)
-        self.toasts = ToastHost(self)
+        self.toasts = ToastHost(self, center_widget=self.stack)  # centred on the page, not page + sidebar
 
         self._shortcuts: list[QShortcut] = []
         self._install_shortcuts()
+        # Keyboard focus starts on the page (Space / C work at once), not on the first Tab stop
+        # (the "Focus" sidebar item) that window activation would otherwise pick.
+        self._focus_current_page()
 
         self.sidebar.navigate.connect(self.show_page)
         ctx.events.navigate.connect(self.show_page)
@@ -169,10 +201,8 @@ class MainWindow(QMainWindow):
         return page
 
     def _build_page(self, key: str) -> QWidget:
-        module_name, class_name = _PAGE_CLASSES[key]
         try:
-            module = importlib.import_module(module_name)
-            page = getattr(module, class_name)(self._ctx)
+            page = _PAGE_FACTORIES[key](self._ctx)
         except Exception:  # noqa: BLE001 - a broken page must not take the whole window down
             log.exception("Could not create the %s page", key)
             page = EmptyState("alert", "This page couldn't load", "Madhura saved the details to its log.")
@@ -199,7 +229,12 @@ class MainWindow(QMainWindow):
         # meanwhile: the stack would hand it to the new page's first control (which on_shown may
         # hide, e.g. the Insights range control in the empty state), and Qt then passes focus on
         # with a Tab reason — lighting a keyboard focus ring nobody asked for.
-        move_focus = fw is None or (old is not None and (fw is old or old.isAncestorOf(fw))) or not fw.isVisible()
+        move_focus = (
+            fw is None
+            or (old is not None and (fw is old or old.isAncestorOf(fw)))
+            or not fw.isVisible()
+            or inside_floating(fw)  # a popover of the outgoing page (it closes with the page)
+        )
         if move_focus:
             self.stack.setFocus(Qt.FocusReason.OtherFocusReason)
         animations.cross_fade(self.stack, self.stack.indexOf(page), PAGE_FADE_MS)
@@ -416,8 +451,10 @@ class MainWindow(QMainWindow):
                 return
             if event.key() == Qt.Key.Key_Escape and not event.modifiers():
                 fw = QApplication.focusWidget()
-                if fw is not None and fw.window() is self:
-                    fw.clearFocus()
+                if fw is None or fw.window() is self:
+                    # Blur: leave the field / control, but keep keyboard focus on the page so its
+                    # keys (Space pause, C capture, list keys) keep working.
+                    self._focus_current_page()
                 event.accept()
                 return
         super().keyPressEvent(event)
@@ -435,8 +472,16 @@ class MainWindow(QMainWindow):
             self._deactivated.start()
         return super().event(e)
 
+    def _focus_current_page(self) -> None:
+        self.pages[self._current].setFocus(Qt.FocusReason.OtherFocusReason)
+
     def showEvent(self, event: QShowEvent) -> None:  # noqa: N802
         super().showEvent(event)
+        fw = self.focusWidget()
+        if fw is None or not fw.isVisibleTo(self):
+            # The remembered focus widget went away while the window was hidden: activation would
+            # hand focus to the first Tab stop (a sidebar item) — give it to the page instead.
+            self._focus_current_page()
         if not self._caption_applied:
             self._caption_applied = True
             self._apply_caption_colors()

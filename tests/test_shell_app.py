@@ -360,6 +360,24 @@ def test_parse_args() -> None:
     assert appmod.parse_args(["--minimized"]).minimized
 
 
+def test_wayland_prefers_xcb_with_wayland_fallback(monkeypatch) -> None:  # noqa: ANN001
+    """A bare "xcb" aborts Qt when libxcb-cursor0 is missing; the list form falls back to Wayland."""
+    monkeypatch.setattr(appmod, "IS_LINUX", True)
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.delenv("QT_QPA_PLATFORM", raising=False)
+    appmod._prepare_platform_env()
+    assert appmod.os.environ["QT_QPA_PLATFORM"] == "xcb;wayland"
+    # An explicit choice is never overridden; no X server → leave Qt's own default alone.
+    monkeypatch.setenv("QT_QPA_PLATFORM", "wayland")
+    appmod._prepare_platform_env()
+    assert appmod.os.environ["QT_QPA_PLATFORM"] == "wayland"
+    monkeypatch.delenv("QT_QPA_PLATFORM")
+    monkeypatch.delenv("DISPLAY")
+    appmod._prepare_platform_env()
+    assert "QT_QPA_PLATFORM" not in appmod.os.environ
+
+
 def test_single_instance_name_is_stable(tmp_path: Path) -> None:
     a = server_name_for(tmp_path / "one")
     assert a == server_name_for(tmp_path / "one")
@@ -407,8 +425,81 @@ def test_main_runs_and_quits(qapp: QApplication, data_dir: Path, monkeypatch) ->
     assert (data_dir / "madhura.db").exists()
 
 
+def test_main_reports_unavailable_database_and_exits(qapp: QApplication, data_dir: Path, monkeypatch) -> None:  # noqa: ANN001
+    """A locked/unreachable DB: explain, exit 1, never start fresh (no window, nothing renamed)."""
+    import sqlite3
+
+    from madhura.data import db as dbmod
+    from madhura.ui import dialogs, theme
+
+    def unavailable(*_a: object, **_kw: object) -> AppContext:
+        raise dbmod.DatabaseUnavailable(data_dir / "madhura.db", sqlite3.OperationalError("database is locked"))
+
+    shown: list[tuple[str, str]] = []
+    monkeypatch.setattr(appmod, "create_context", unavailable)
+    monkeypatch.setattr(dialogs, "show_error", lambda _parent, title, text: shown.append((title, text)))
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+    root = logging.getLogger()
+    handlers_before = list(root.handlers)
+    windows_before = set(QApplication.topLevelWidgets())
+    try:
+        code = appmod.main(["madhura"])
+    finally:
+        for h in list(root.handlers):
+            if h not in handlers_before:
+                root.removeHandler(h)
+                h.close()
+        theme.set_current(None)
+        qapp.setStyleSheet("")
+    assert code == 1
+    assert [t for t, _ in shown] == ["Madhura can't open its data right now"]
+    assert "madhura.db" in shown[0][1] and "database is locked" in shown[0][1]
+    new_windows = set(QApplication.topLevelWidgets()) - windows_before
+    assert not [w for w in new_windows if w.objectName() == "mhMainWindow"]
+
+
 def test_dunder_main_imports() -> None:
     import importlib
 
     mod = importlib.import_module("madhura.__main__")
     assert mod.main is appmod.main
+
+
+def test_frozen_build_import_analysis_reaches_every_module() -> None:
+    """A frozen build (PyInstaller) bundles what static import analysis reaches from the entry
+    point. Pages and feature services are imported lazily, so they must be imported with literal
+    import statements — a module name handed to importlib would leave them out, and every page
+    would show "This page couldn't load"."""
+    from modulefinder import ModuleFinder
+
+    import madhura
+
+    pkg = Path(madhura.__file__).resolve().parent
+    finder = ModuleFinder(path=[str(pkg.parent)])  # only our package; stdlib / Qt are irrelevant here
+    finder.run_script(str(pkg / "__main__.py"))
+    names = set()
+    for path in pkg.rglob("*.py"):
+        parts = path.relative_to(pkg.parent).with_suffix("").parts
+        names.add(".".join(parts[:-1] if parts[-1] == "__init__" else parts))
+    names.discard("madhura.__main__")  # the entry script itself
+    missing = sorted(n for n in names if n not in finder.modules)
+    assert not missing, missing
+
+
+def test_a_broken_feature_service_does_not_stop_the_app(
+    qapp: QApplication, data_dir: Path, fake_clock: FakeClock, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import madhura.services.nudge_service as nudge_mod
+
+    def boom(_ctx: object) -> None:
+        raise RuntimeError("broken service")
+
+    monkeypatch.setattr(nudge_mod, "NudgeService", boom)
+    with caplog.at_level(logging.ERROR, logger="madhura.app"):
+        ctx = make_shell(qapp, data_dir, fake_clock)
+    try:
+        assert ctx.nudges is None
+        assert ctx.checkins is not None and ctx.away is not None and ctx.habit_reminders is not None
+        assert any("Could not start nudges" in r.getMessage() for r in caplog.records)
+    finally:
+        dispose_shell(ctx, qapp)

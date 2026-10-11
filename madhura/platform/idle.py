@@ -7,11 +7,15 @@ import sys
 from collections.abc import Callable
 from typing import Any
 
+from madhura.log import warn_once
+
 __all__ = ["get_idle_seconds", "idle_ms_from_ticks"]
 
 log = logging.getLogger(__name__)
 
 _U32 = 0xFFFFFFFF
+#: Failures already logged at WARNING (repeats go to DEBUG; see :func:`madhura.log.warn_once`).
+_WARNED: set[str] = set()
 
 
 class _Cache:
@@ -41,7 +45,7 @@ def _windows_fn() -> Callable[[], float | None] | None:
         info = LASTINPUTINFO()
         info.cbSize = ctypes.sizeof(LASTINPUTINFO)
         if not user32.GetLastInputInfo(ctypes.byref(info)):
-            return None
+            raise OSError("GetLastInputInfo failed")
         now = int(kernel32.GetTickCount()) & _U32
         return idle_ms_from_ticks(now, info.dwTime) / 1000.0
 
@@ -73,14 +77,16 @@ def _resolve() -> Callable[[], float | None] | None:
     if _Cache.resolved:
         return _Cache.fn
     _Cache.resolved = True
+    if sys.platform not in ("win32", "darwin"):
+        return None  # no portable API: idle-based features are simply off (documented)
     try:
-        if sys.platform == "win32":
-            _Cache.fn = _windows_fn()
-        elif sys.platform == "darwin":
-            _Cache.fn = _mac_fn()
+        _Cache.fn = _windows_fn() if sys.platform == "win32" else _mac_fn()
     except Exception:  # noqa: BLE001 - platform probing must never raise
-        log.debug("Idle-time API unavailable", exc_info=True)
+        warn_once(log, _WARNED, "resolve", "Idle-time API unavailable; away detection and idle checks are off")
         _Cache.fn = None
+    else:
+        if _Cache.fn is None:
+            log.warning("Idle-time API not found; away detection and idle checks are off")
     return _Cache.fn
 
 
@@ -91,6 +97,6 @@ def get_idle_seconds() -> float | None:
         return None
     try:
         return fn()
-    except Exception:  # noqa: BLE001
-        log.debug("Idle-time query failed", exc_info=True)
+    except Exception:  # noqa: BLE001 - platform probing must never raise
+        warn_once(log, _WARNED, "query", "Idle-time query failed")
         return None
